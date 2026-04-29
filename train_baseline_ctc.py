@@ -11,20 +11,27 @@ def train(args):
     from torch import nn
 
     from semg_jepa.architecture import BaselineCTCModel
+    from semg_jepa.cached_dataset import CachedRawEMGDataset
     from semg_jepa.ctc_utils import evaluate_text_metrics
     from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
     from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
     from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
 
-    with open(args.data_config) as f:
-        data_config = json.load(f)
+    if args.use_cache:
+        if not args.cache_dir:
+            raise ValueError("--use-cache requires --cache-dir")
+        trainset = CachedRawEMGDataset(args.cache_dir, "train")
+        devset = CachedRawEMGDataset(args.cache_dir, "dev")
+    else:
+        with open(args.data_config) as f:
+            data_config = json.load(f)
+        trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
+        devset = EMGDataset(data_config, dev=True, raw_only=True)
 
-    trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
     if args.data_fraction < 1.0:
         trainset = trainset.subset(args.data_fraction)
-    devset = EMGDataset(data_config, dev=True, raw_only=True)
-    n_chars = len(devset.text_transform.chars)
 
+    n_chars = len(devset.text_transform.chars)
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     model = BaselineCTCModel(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout, vocab_size=n_chars).to(device)
 
@@ -35,7 +42,7 @@ def train(args):
         trainset,
         pin_memory=(device == "cuda"),
         num_workers=0,
-        collate_fn=EMGDataset.collate_raw,
+        collate_fn=trainset.collate_raw,
         batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
     )
 
@@ -81,7 +88,6 @@ def train(args):
         current_lr = optim.param_groups[0]["lr"]
 
         logging.info("epoch=%s train/loss=%.4f dev/wer=%.4f dev/cer=%.4f lr=%.6f", epoch + 1, train_loss, dev_wer, dev_cer, current_lr)
-
         wandb_log(run, {"epoch": epoch + 1, "train/ctc_loss": train_loss, "dev/wer": dev_wer, "dev/cer": dev_cer, "lr": current_lr})
 
         torch.save(model.state_dict(), os.path.join(args.output_directory, "last.pt"))
@@ -94,7 +100,9 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-config", required=True)
+    p.add_argument("--data-config", default=None)
+    p.add_argument("--use-cache", action="store_true")
+    p.add_argument("--cache-dir", default=None)
     p.add_argument("--output-directory", default="output_baseline")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--max-batch-len", type=int, default=128000)

@@ -9,19 +9,38 @@ A lightweight project based on `dgaddy/silent_speech` for:
 
 ## Data config
 
-All scripts accept `--data-config path/to/config.json` with keys:
+All live-loading scripts accept `--data-config path/to/config.json` with keys:
 
 - `testset_file`
 - `silent_data_directories`
 - `voiced_data_directories`
 - `remove_channels` (optional)
 
-## Scripts
+## Cache precomputation
 
-- `train_baseline_ctc.py`
-- `train_jepa_pretrain.py`
-- `train_jepa_finetune_ctc.py`
-- `evaluate_ctc.py`
+```bash
+python scripts/precompute_raw_emg.py \
+  --data-config data_config.json \
+  --cache-dir cache/raw_emg \
+  --num-workers 16
+```
+
+Then validate:
+
+```bash
+python scripts/validate_raw_emg_cache.py \
+  --data-config data_config.json \
+  --cache-dir cache/raw_emg \
+  --split train \
+  --num-examples 20
+```
+
+## Train/eval from cache
+
+- Baseline: `python train_baseline_ctc.py --use-cache --cache-dir cache/raw_emg`
+- JEPA pretrain: `python train_jepa_pretrain.py --use-cache --cache-dir cache/raw_emg`
+- JEPA finetune: `python train_jepa_finetune_ctc.py --use-cache --cache-dir cache/raw_emg --pretrained-encoder <pt>`
+- Eval: `python evaluate_ctc.py --use-cache --cache-dir cache/raw_emg --split test --checkpoint <pt>`
 
 ## Optional W&B logging
 
@@ -31,7 +50,8 @@ Example:
 
 ```bash
 python train_baseline_ctc.py \
-  --data-config data_config.json \
+  --use-cache \
+  --cache-dir cache/raw_emg \
   --wandb \
   --wandb-entity UMLforVideoLab \
   --wandb-project JEPAforsEMG \

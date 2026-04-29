@@ -6,7 +6,10 @@ import os
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-config", required=True)
+    p.add_argument("--data-config", default=None)
+    p.add_argument("--use-cache", action="store_true")
+    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--split", choices=["train", "dev", "test"], default="dev")
     p.add_argument("--pretrained-encoder", required=True)
     p.add_argument("--output-directory", default="output_jepa_finetune")
     p.add_argument("--epochs", type=int, default=80)
@@ -35,6 +38,7 @@ def train(args):
     from torch import nn
 
     from semg_jepa.architecture import CTCHead, GaddyRawEMGEncoder
+    from semg_jepa.cached_dataset import CachedRawEMGDataset
     from semg_jepa.ctc_utils import evaluate_text_metrics
     from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
     from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
@@ -49,14 +53,23 @@ def train(args):
         def forward(self, raw_emg):
             return self.ctc_head(self.encoder(raw_emg))
 
-    with open(args.data_config) as f:
-        data_config = json.load(f)
+    if args.use_cache:
+        if not args.cache_dir:
+            raise ValueError("--use-cache requires --cache-dir")
+        trainset = CachedRawEMGDataset(args.cache_dir, "train")
+        devset = CachedRawEMGDataset(args.cache_dir, "dev")
+    else:
+        if not args.data_config:
+            raise ValueError("--data-config is required when not using --use-cache")
+        with open(args.data_config) as f:
+            data_config = json.load(f)
+        trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
+        devset = EMGDataset(data_config, dev=True, raw_only=True)
 
-    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
     if args.data_fraction < 1.0:
         trainset = trainset.subset(args.data_fraction)
-    devset = EMGDataset(data_config, dev=True, raw_only=True)
+
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     n_chars = len(devset.text_transform.chars)
 
     encoder = GaddyRawEMGEncoder(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout)
@@ -72,7 +85,7 @@ def train(args):
         trainset,
         pin_memory=(device == "cuda"),
         num_workers=0,
-        collate_fn=EMGDataset.collate_raw,
+        collate_fn=trainset.collate_raw,
         batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
     )
 
@@ -102,7 +115,6 @@ def train(args):
         current_lr = optim.param_groups[0]["lr"]
 
         logging.info("epoch=%s train/loss=%.4f dev/wer=%.4f dev/cer=%.4f lr=%.6f", epoch + 1, train_loss, dev_wer, dev_cer, current_lr)
-
         wandb_log(run, {"epoch": epoch + 1, "train/ctc_loss": train_loss, "dev/wer": dev_wer, "dev/cer": dev_cer, "lr": current_lr})
 
         torch.save(model.state_dict(), os.path.join(args.output_directory, "last.pt"))

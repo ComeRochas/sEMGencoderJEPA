@@ -7,7 +7,9 @@ import os
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-config", required=True)
+    p.add_argument("--data-config", default=None)
+    p.add_argument("--use-cache", action="store_true")
+    p.add_argument("--cache-dir", default=None)
     p.add_argument("--output-directory", default="output_jepa_pretrain")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--max-batch-len", type=int, default=128000)
@@ -35,35 +37,46 @@ def train(args):
 
     from semg_jepa.architecture import GaddyRawEMGEncoder
     from semg_jepa.augmentations import RawEMGAugment
+    from semg_jepa.cached_dataset import CachedRawEMGDataset
     from semg_jepa.data_utils import combine_fixed_length
     from semg_jepa.jepa_utils import embedding_std_mean, update_ema, variance_regularizer
     from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
     from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
 
     class JEPAModel(torch.nn.Module):
-        def __init__(self, encoder: GaddyRawEMGEncoder, proj_dim=256):
+        def __init__(self, encoder: GaddyRawEMGEncoder):
             super().__init__()
             self.encoder = encoder
             hidden = encoder.w_raw_in.out_features
-            self.predictor = torch.nn.Sequential(torch.nn.Linear(hidden, hidden), torch.nn.GELU(), torch.nn.Linear(hidden, proj_dim))
-            self.target_proj = torch.nn.Linear(hidden, proj_dim)
+            self.predictor = torch.nn.Sequential(
+                torch.nn.Linear(hidden, hidden),
+                torch.nn.GELU(),
+                torch.nn.Linear(hidden, hidden),
+            )
 
         def forward_student(self, raw):
             return self.predictor(self.encoder(raw))
 
         def forward_teacher(self, raw):
-            return self.target_proj(self.encoder(raw))
+            return self.encoder(raw)
 
-    with open(args.data_config) as f:
-        data_config = json.load(f)
+    if args.use_cache:
+        if not args.cache_dir:
+            raise ValueError("--use-cache requires --cache-dir")
+        trainset = CachedRawEMGDataset(args.cache_dir, "train")
+    else:
+        if not args.data_config:
+            raise ValueError("--data-config is required when not using --use-cache")
+        with open(args.data_config) as f:
+            data_config = json.load(f)
+        trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
     dataloader = torch.utils.data.DataLoader(
         trainset,
         pin_memory=(device == "cuda"),
         num_workers=0,
-        collate_fn=EMGDataset.collate_raw,
+        collate_fn=trainset.collate_raw,
         batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
     )
 
