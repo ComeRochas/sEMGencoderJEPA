@@ -3,13 +3,31 @@ import json
 import logging
 import os
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+import tqdm
+from torch import nn
+
+from semg_jepa.architecture import CTCHead, GaddyRawEMGEncoder
+from semg_jepa.ctc_utils import evaluate_wer
+from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
+from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
+
+
+class FinetuneCTCModel(nn.Module):
+    def __init__(self, encoder, ctc_head):
+        super().__init__()
+        self.encoder = encoder
+        self.ctc_head = ctc_head
+
+    def forward(self, raw_emg):
+        return self.ctc_head(self.encoder(raw_emg))
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-config", default=None)
-    p.add_argument("--use-cache", action="store_true")
-    p.add_argument("--cache-dir", default=None)
-    p.add_argument("--split", choices=["train", "dev", "test"], default="dev")
+    p.add_argument("--data-config", required=True)
     p.add_argument("--pretrained-encoder", required=True)
     p.add_argument("--output-directory", default="output_jepa_finetune")
     p.add_argument("--epochs", type=int, default=80)
@@ -17,59 +35,21 @@ def parse_args():
     p.add_argument("--fixed-raw-len", type=int, default=1600)
     p.add_argument("--learning-rate", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--data-fraction", type=float, default=1.0)
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--model-size", type=int, default=768)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--cpu", action="store_true")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb-entity", default="UMLforVideoLab")
-    p.add_argument("--wandb-project", default="JEPAforsEMG")
-    p.add_argument("--wandb-run-name", default=None)
-    p.add_argument("--wandb-tags", nargs="*", default=None)
     return p.parse_args()
 
 
 def train(args):
-    import torch
-    import torch.nn.functional as F
-    import tqdm
-    from torch import nn
-
-    from semg_jepa.architecture import CTCHead, GaddyRawEMGEncoder
-    from semg_jepa.cached_dataset import CachedRawEMGDataset
-    from semg_jepa.ctc_utils import evaluate_text_metrics
-    from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
-    from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
-    from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
-
-    class FinetuneCTCModel(nn.Module):
-        def __init__(self, encoder, ctc_head):
-            super().__init__()
-            self.encoder = encoder
-            self.ctc_head = ctc_head
-
-        def forward(self, raw_emg):
-            return self.ctc_head(self.encoder(raw_emg))
-
-    if args.use_cache:
-        if not args.cache_dir:
-            raise ValueError("--use-cache requires --cache-dir")
-        trainset = CachedRawEMGDataset(args.cache_dir, "train")
-        devset = CachedRawEMGDataset(args.cache_dir, "dev")
-    else:
-        if not args.data_config:
-            raise ValueError("--data-config is required when not using --use-cache")
-        with open(args.data_config) as f:
-            data_config = json.load(f)
-        trainset = EMGDataset(data_config, dev=False, test=False, raw_only=True)
-        devset = EMGDataset(data_config, dev=True, raw_only=True)
-
-    if args.data_fraction < 1.0:
-        trainset = trainset.subset(args.data_fraction)
+    with open(args.data_config) as f:
+        data_config = json.load(f)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    trainset = EMGDataset(data_config, dev=False, test=False)
+    devset = EMGDataset(data_config, dev=True)
     n_chars = len(devset.text_transform.chars)
 
     encoder = GaddyRawEMGEncoder(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout)
@@ -85,13 +65,12 @@ def train(args):
         trainset,
         pin_memory=(device == "cuda"),
         num_workers=0,
-        collate_fn=trainset.collate_raw,
+        collate_fn=EMGDataset.collate_raw,
         batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
     )
 
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
-    run = init_wandb(args)
 
     os.makedirs(args.output_directory, exist_ok=True)
     best_wer = float("inf")
@@ -109,20 +88,14 @@ def train(args):
             optim.step()
             losses.append(loss.item())
 
-        train_loss = (sum(losses) / len(losses)) if losses else 0.0
-        metrics = evaluate_text_metrics(model, devset, device)
-        dev_wer, dev_cer = metrics["wer"], metrics["cer"]
-        current_lr = optim.param_groups[0]["lr"]
-
-        logging.info("epoch=%s train/loss=%.4f dev/wer=%.4f dev/cer=%.4f lr=%.6f", epoch + 1, train_loss, dev_wer, dev_cer, current_lr)
-        wandb_log(run, {"epoch": epoch + 1, "train/ctc_loss": train_loss, "dev/wer": dev_wer, "dev/cer": dev_cer, "lr": current_lr})
+        train_loss = float(np.mean(losses)) if losses else 0.0
+        wer = evaluate_wer(model, devset, device)
+        logging.info("epoch=%s train_loss=%.4f dev_wer=%.3f", epoch + 1, train_loss, wer)
 
         torch.save(model.state_dict(), os.path.join(args.output_directory, "last.pt"))
-        if dev_wer < best_wer:
-            best_wer = dev_wer
+        if wer < best_wer:
+            best_wer = wer
             torch.save(model.state_dict(), os.path.join(args.output_directory, "best.pt"))
-
-    finish_wandb(run)
 
 
 if __name__ == "__main__":

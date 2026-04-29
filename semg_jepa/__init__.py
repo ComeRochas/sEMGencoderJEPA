@@ -1,7 +1,6 @@
 """sEMG JEPA training package."""
 
-from .architecture import CTCHead, GaddyRawEMGEncoder
-from .cached_dataset import CachedRawEMGDataset
+from .architecture import GaddyRawEMGEncoder, CTCHead
 from .read_emg import EMGDataset, SizeAwareSampler
 
-__all__ = ["GaddyRawEMGEncoder", "CTCHead", "EMGDataset", "SizeAwareSampler", "CachedRawEMGDataset"]
+__all__ = ["GaddyRawEMGEncoder", "CTCHead", "EMGDataset", "SizeAwareSampler"]

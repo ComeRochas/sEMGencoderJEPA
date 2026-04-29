@@ -1,9 +1,8 @@
+import jiwer
 import torch
 import torch.nn.functional as F
 import tqdm
 from ctcdecode import CTCBeamDecoder
-
-from .metrics import compute_text_metrics
 
 
 def build_decoder(chars):
@@ -11,7 +10,7 @@ def build_decoder(chars):
     return CTCBeamDecoder(chars + "_", blank_id=blank_id, log_probs_input=True, model_path="lm.binary", alpha=1.5, beta=1.85)
 
 
-def decode_predictions(model, dataset, device, batch_size=1):
+def evaluate_wer(model, dataset, device, batch_size=1):
     model.eval()
     decoder = build_decoder(dataset.text_transform.chars)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
@@ -25,9 +24,4 @@ def decode_predictions(model, dataset, device, batch_size=1):
             predictions.append(dataset.text_transform.int_to_text(pred_int))
             references.append(dataset.text_transform.clean_text(example["text"][0]))
     model.train()
-    return references, predictions
-
-
-def evaluate_text_metrics(model, dataset, device, batch_size=1):
-    references, predictions = decode_predictions(model, dataset, device, batch_size=batch_size)
-    return compute_text_metrics(references, predictions)
+    return jiwer.wer(references, predictions)
