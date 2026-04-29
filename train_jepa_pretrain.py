@@ -39,26 +39,9 @@ def train(args):
     from semg_jepa.augmentations import RawEMGAugment
     from semg_jepa.cached_dataset import CachedRawEMGDataset
     from semg_jepa.data_utils import combine_fixed_length
-    from semg_jepa.jepa_utils import embedding_std_mean, update_ema, variance_regularizer
+    from semg_jepa.jepa_utils import embedding_std_mean, update_ema_encoder, variance_regularizer
     from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
     from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
-
-    class JEPAModel(torch.nn.Module):
-        def __init__(self, encoder: GaddyRawEMGEncoder):
-            super().__init__()
-            self.encoder = encoder
-            hidden = encoder.w_raw_in.out_features
-            self.predictor = torch.nn.Sequential(
-                torch.nn.Linear(hidden, hidden),
-                torch.nn.GELU(),
-                torch.nn.Linear(hidden, hidden),
-            )
-
-        def forward_student(self, raw):
-            return self.predictor(self.encoder(raw))
-
-        def forward_teacher(self, raw):
-            return self.encoder(raw)
 
     if args.use_cache:
         if not args.cache_dir:
@@ -80,30 +63,48 @@ def train(args):
         batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
     )
 
-    student = JEPAModel(GaddyRawEMGEncoder(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout)).to(device)
-    teacher = copy.deepcopy(student).to(device)
-    for p in teacher.parameters():
+    student_encoder = GaddyRawEMGEncoder(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout).to(device)
+    teacher_encoder = copy.deepcopy(student_encoder).to(device)
+    if hasattr(teacher_encoder, "apply_train_shift"):
+        teacher_encoder.apply_train_shift = False
+
+    hidden = student_encoder.w_raw_in.out_features
+    predictor = torch.nn.Sequential(
+        torch.nn.Linear(hidden, hidden),
+        torch.nn.GELU(),
+        torch.nn.Linear(hidden, hidden),
+    ).to(device)
+
+    for p in teacher_encoder.parameters():
         p.requires_grad = False
 
     weak_aug = RawEMGAugment(channel_dropout=0.05, time_mask_prob=0.2, time_mask_max=20, amp_scale=0.05, noise_std=0.005, temporal_shift=2)
     strong_aug = RawEMGAugment(channel_dropout=0.2, time_mask_prob=0.7, time_mask_max=80, amp_scale=0.2, noise_std=0.02, temporal_shift=8)
 
-    optim = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optim = torch.optim.AdamW(list(student_encoder.parameters()) + list(predictor.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
     run = init_wandb(args)
 
     os.makedirs(args.output_directory, exist_ok=True)
 
     for epoch in range(args.epochs):
+        student_encoder.train()
+        predictor.train()
+        teacher_encoder.eval()
+
         loss_sum = cosine_sum = variance_sum = std_sum = 0.0
         n = 0
+
         for example in tqdm.tqdm(dataloader, desc="JEPA pretrain"):
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             student_view = strong_aug(raw)
             teacher_view = weak_aug(raw)
 
-            pred = F.normalize(student.forward_student(student_view), dim=-1)
+            student_latent = student_encoder(student_view)
+            pred = F.normalize(predictor(student_latent), dim=-1)
+
             with torch.no_grad():
-                target = F.normalize(teacher.forward_teacher(teacher_view), dim=-1)
+                teacher_encoder.eval()
+                target = F.normalize(teacher_encoder(teacher_view), dim=-1)
 
             cosine_loss = 1 - (pred * target).sum(dim=-1).mean()
             var_loss = variance_regularizer(pred)
@@ -113,7 +114,7 @@ def train(args):
             optim.zero_grad()
             loss.backward()
             optim.step()
-            update_ema(student, teacher, args.ema_momentum)
+            update_ema_encoder(student_encoder, teacher_encoder, args.ema_momentum)
 
             loss_sum += loss.item()
             cosine_sum += cosine_loss.item()
@@ -146,9 +147,16 @@ def train(args):
             },
         )
 
-        torch.save(student.state_dict(), os.path.join(args.output_directory, "student_last.pt"))
+        torch.save(
+            {
+                "student_encoder": student_encoder.state_dict(),
+                "predictor": predictor.state_dict(),
+                "args": vars(args),
+            },
+            os.path.join(args.output_directory, "student_last.pt"),
+        )
 
-    torch.save(student.encoder.state_dict(), os.path.join(args.output_directory, "pretrained_encoder.pt"))
+    torch.save(student_encoder.state_dict(), os.path.join(args.output_directory, "pretrained_encoder.pt"))
     finish_wandb(run)
 
 
