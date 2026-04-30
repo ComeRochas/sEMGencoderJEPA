@@ -1,13 +1,18 @@
-import jiwer
 import torch
 import torch.nn.functional as F
-import tqdm
 from pyctcdecode import build_ctcdecoder
+
+from semg_jepa.metrics import compute_cer, compute_wer
 
 
 def build_decoder(chars):
     labels = list(chars) + [""]  # blank at index len(chars)
-    return build_ctcdecoder(labels, kenlm_model_path="lm.binary", alpha=1.5, beta=1.85)
+    try:
+        return build_ctcdecoder(labels, kenlm_model_path="data/lm.binary", alpha=1.5, beta=1.85)
+    except Exception as e:
+        print(f"[ctc_utils] LM-backed decoder unavailable ({type(e).__name__}: {e}); "
+              f"falling back to no-LM beam search. WER will be higher.", flush=True)
+        return build_ctcdecoder(labels)
 
 
 def _collate_eval(batch):
@@ -28,7 +33,7 @@ def evaluate(model, dataset, device, batch_size=16):
     )
     references, predictions = [], []
     with torch.no_grad():
-        for raw_padded, seq_lens, texts in tqdm.tqdm(dataloader, "Evaluate", disable=None):
+        for raw_padded, seq_lens, texts in dataloader:
             raw_padded = raw_padded.to(device)
             log_probs = F.log_softmax(model(raw_padded), -1).cpu().numpy()
             for i in range(len(texts)):
@@ -36,4 +41,4 @@ def evaluate(model, dataset, device, batch_size=16):
                 predictions.append(decoder.decode(log_probs[i, :T]))
                 references.append(dataset.text_transform.clean_text(texts[i]))
     model.train()
-    return jiwer.wer(references, predictions), jiwer.cer(references, predictions)
+    return compute_wer(references, predictions), compute_cer(references, predictions)

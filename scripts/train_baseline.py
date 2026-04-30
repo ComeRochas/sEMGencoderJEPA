@@ -1,11 +1,11 @@
 import argparse
 import logging
 import os
+import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import tqdm
 from torch import nn
 
 from semg_jepa.architecture import BaselineCTCModel
@@ -13,6 +13,11 @@ from semg_jepa.cached_dataset import CachedRawEMGDataset, build_batches
 from semg_jepa.ctc_utils import evaluate
 from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
 from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
+
+
+def _sync(device):
+    if device == "cuda":
+        torch.cuda.synchronize()
 
 
 def train(args):
@@ -60,27 +65,64 @@ def train(args):
             batch_sampler=batches,
         )
         losses = []
-        for example in tqdm.tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
+        t = {"data": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0}
+        epoch_start = time.perf_counter()
+        n_steps = 0
+        t0 = time.perf_counter()
+        for example in dataloader:
+            t["data"] += time.perf_counter() - t0
+
             schedule_lr(global_step)
+
+            t1 = time.perf_counter()
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             pred = F.log_softmax(model(raw), dim=-1)
             pred = nn.utils.rnn.pad_sequence(decollate_tensor(pred, example["lengths"]), batch_first=False)
             targets = nn.utils.rnn.pad_sequence(example["text_int"], batch_first=True).to(device)
             loss = F.ctc_loss(pred, targets, example["lengths"], example["text_int_lengths"], blank=n_chars)
+            _sync(device)
+            t["fwd"] += time.perf_counter() - t1
+
+            t2 = time.perf_counter()
             loss.backward()
+            _sync(device)
+            t["bwd"] += time.perf_counter() - t2
+
             losses.append(loss.item())
 
+            t3 = time.perf_counter()
             if (global_step + 1) % args.grad_accum_steps == 0:
                 optim.step()
                 optim.zero_grad()
+                _sync(device)
+            t["opt"] += time.perf_counter() - t3
+
             global_step += 1
+            n_steps += 1
+            t0 = time.perf_counter()
 
         train_loss = float(np.mean(losses)) if losses else 0.0
-        wer, cer = evaluate(model, devset, device)
-        lr_sched.step()
 
-        logging.info("epoch=%s train_loss=%.4f dev_wer=%.3f dev_cer=%.3f", epoch + 1, train_loss, wer, cer)
-        wandb_log(run, {"epoch": epoch + 1, "train_loss": train_loss, "dev_wer": wer, "dev_cer": cer})
+        eval_start = time.perf_counter()
+        wer, cer = evaluate(model, devset, device)
+        t_eval = time.perf_counter() - eval_start
+
+        lr_sched.step()
+        t_epoch = time.perf_counter() - epoch_start
+        cur_lr = optim.param_groups[0]["lr"]
+
+        logging.info(
+            "epoch=%d steps=%d lr=%.2e train_loss=%.4f dev_wer=%.3f dev_cer=%.3f "
+            "t_data=%.1fs t_fwd=%.1fs t_bwd=%.1fs t_opt=%.1fs t_eval=%.1fs t_epoch=%.1fs",
+            epoch + 1, n_steps, cur_lr, train_loss, wer, cer,
+            t["data"], t["fwd"], t["bwd"], t["opt"], t_eval, t_epoch,
+        )
+        wandb_log(run, {
+            "epoch": epoch + 1, "train_loss": train_loss, "dev_wer": wer, "dev_cer": cer,
+            "lr": cur_lr,
+            "t_data": t["data"], "t_fwd": t["fwd"], "t_bwd": t["bwd"], "t_opt": t["opt"],
+            "t_eval": t_eval, "t_epoch": t_epoch,
+        })
 
         torch.save(model.state_dict(), os.path.join(args.output_directory, "last.pt"))
         if wer < best_wer:
