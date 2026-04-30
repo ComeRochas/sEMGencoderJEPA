@@ -1,26 +1,75 @@
 # semg-jepa
 
-A lightweight project based on `dgaddy/silent_speech` for:
+EMG-to-text silent speech framework based on [Gaddy & Klein (2021)](https://github.com/dgaddy/silent_speech).
 
-- baseline raw-EMG CTC training,
-- JEPA self-supervised pretraining,
-- CTC fine-tuning from JEPA checkpoints,
-- CTC beam-search WER evaluation.
+Three training pipelines:
+1. **Baseline CTC** — supervised, raw EMG → characters
+2. **JEPA pretraining** — self-supervised student/teacher encoder
+3. **JEPA fine-tuning** — CTC head on pretrained encoder
 
-## Data config
+## Setup
 
-All scripts accept `--data-config path/to/config.json` with keys:
+```bash
+export PYTHONPATH=/scratch/cr4206/sEMGencoderJEPA
+PYTHON=/scratch/cr4206/envs/silent_speech/bin/python
+```
 
-- `normalizers_file`
-- `testset_file`
-- `silent_data_directories`
-- `voiced_data_directories`
-- `text_align_directory`
-- `remove_channels` (optional)
+## Workflow
+
+### 1. Precompute cache (once)
+
+```bash
+sbatch slurm/precompute_raw_emg.slurm
+# produces data/{train,dev,test}.pt  (~677 MB total, 8055/200/99 samples)
+```
+
+### 2. Train
+
+```bash
+# Baseline CTC (200 epochs)
+sbatch slurm/train_baseline_cached.slurm
+
+# JEPA self-supervised pretraining (100 epochs)
+sbatch slurm/train_jepa_pretrain_cached.slurm
+
+# Fine-tune CTC from JEPA encoder (80 epochs, after pretraining)
+sbatch slurm/train_jepa_finetune_cached.slurm
+```
+
+Override any variable at submission time:
+```bash
+OUTPUT_DIR=/scratch/cr4206/sEMGencoderJEPA/runs/baseline_v2 sbatch slurm/train_baseline_cached.slurm
+```
+
+### 3. Evaluate
+
+```bash
+$PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt           # test set
+$PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt --split dev
+```
 
 ## Scripts
 
-- `train_baseline_ctc.py`
-- `train_jepa_pretrain.py`
-- `train_jepa_finetune_ctc.py`
-- `evaluate_ctc.py`
+| File | Purpose |
+|------|---------|
+| `train_baseline.py` | Supervised CTC baseline |
+| `train_jepa.py` | JEPA self-supervised pretraining |
+| `finetune_from_jepa.py` | CTC fine-tune from JEPA encoder |
+| `evaluate_ctc.py` | WER + CER evaluation |
+| `scripts/precompute_raw_emg.py` | Precompute raw EMG cache |
+
+## W&B
+
+All training scripts support `--wandb` (offline by default; set `WANDB_MODE=online` for live sync).
+Entity: `UMLforVideoLab` · Project: `JEPAforsEMG`
+
+To sync offline runs:
+```bash
+wandb sync runs/baseline/wandb/
+```
+
+## Data
+
+- Raw EMG: `/scratch/cr4206/data/emg_data/emg_data/`
+- Config: `configs/data_config.json`
+- Cache: `data/{train,dev,test}.pt`

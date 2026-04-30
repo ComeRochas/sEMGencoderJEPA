@@ -48,7 +48,7 @@ def _worker(task, remove_channels):
     from semg_jepa.read_emg import load_utterance
 
     text_transform = TextTransform()
-    utt = load_utterance(task["directory"], task["idx"], remove_channels=remove_channels, raw_only=True)
+    utt = load_utterance(task["directory"], task["idx"], remove_channels=remove_channels)
 
     raw = torch.from_numpy(utt["raw_emg"]).to(torch.float16)
     text_int = torch.tensor(text_transform.text_to_int(utt["text"]), dtype=torch.long)
@@ -78,11 +78,11 @@ def _precompute_split(config, split, cache_dir, num_workers):
 
     is_dev = split == "dev"
     is_test = split == "test"
-    dataset = EMGDataset(config, dev=is_dev, test=is_test, raw_only=True)
+    dataset = EMGDataset(config, dev=is_dev, test=is_test)
     tasks = [_task_from_example(ex) for ex in dataset.example_indices]
 
     out_path = Path(cache_dir) / f"{split}.pt"
-    print(f"[{split}] samples={len(tasks)}")
+    print(f"[{split}] samples={len(tasks)} | out={out_path}", flush=True)
 
     start = time.time()
     samples = [None] * len(tasks)
@@ -98,13 +98,13 @@ def _precompute_split(config, split, cache_dir, num_workers):
                 samples[idx] = fut.result()
             except Exception as exc:  # noqa: BLE001
                 errors += 1
-                print(f"[{split}] ERROR at idx={idx}: {exc}")
+                print(f"[{split}] ERROR at idx={idx}: {exc}", flush=True)
 
             if done % max(1, len(tasks) // 20) == 0 or done == len(tasks):
                 elapsed = time.time() - start
                 sps = done / max(elapsed, 1e-6)
                 eta = (len(tasks) - done) / max(sps, 1e-6)
-                print(f"[{split}] {done}/{len(tasks)} | {sps:.2f} samples/s | ETA {eta/60:.2f} min | errors {errors}")
+                print(f"[{split}] {done}/{len(tasks)} | {sps:.2f} samples/s | ETA {eta/60:.2f} min | errors {errors}", flush=True)
 
     samples = [s for s in samples if s is not None]
     payload = {
@@ -129,7 +129,7 @@ def _precompute_split(config, split, cache_dir, num_workers):
 
     elapsed = time.time() - start
     size_mb = out_path.stat().st_size / (1024 * 1024)
-    print(f"[{split}] done in {elapsed/60:.2f} min | saved={out_path} | size={size_mb:.2f} MB | errors={errors}")
+    print(f"[{split}] done in {elapsed/60:.2f} min | saved={out_path} | size={size_mb:.2f} MB | errors={errors}", flush=True)
 
 
 def parse_args():
@@ -137,7 +137,8 @@ def parse_args():
     p.add_argument("--data-config", default=None)
     p.add_argument("--emg-data-dir", default=None)
     p.add_argument("--testset-file", default=None)
-    p.add_argument("--cache-dir", required=True)
+    p.add_argument("--cache-dir", default="/scratch/cr4206/sEMGencoderJEPA/data",
+                   help="Directory where precomputed .pt files will be saved")
     p.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     p.add_argument("--remove-channels", nargs="*", default=[])
     return p.parse_args()
@@ -146,6 +147,7 @@ def parse_args():
 def main():
     args = parse_args()
     config = _build_config(args)
+    print(f"[precompute] cache_dir={args.cache_dir} num_workers={args.num_workers} data_source={args.data_config or args.emg_data_dir}", flush=True)
     for split in ["train", "dev", "test"]:
         _precompute_split(config, split, args.cache_dir, args.num_workers)
 

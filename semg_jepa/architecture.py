@@ -55,7 +55,8 @@ class GaddyRawEMGEncoder(nn.Module):
         if self.training and self.apply_train_shift:
             shift = random.randrange(8)
             if shift > 0:
-                x_raw[:, :-shift, :] = x_raw[:, shift:, :]
+                x_raw = raw_emg.clone()
+                x_raw[:, :-shift, :] = raw_emg[:, shift:, :]
                 x_raw[:, -shift:, :] = 0
 
         x_raw = x_raw.transpose(1, 2)

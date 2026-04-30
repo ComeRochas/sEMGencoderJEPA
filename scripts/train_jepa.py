@@ -1,6 +1,5 @@
 import argparse
 import copy
-import json
 import logging
 import os
 
@@ -10,8 +9,9 @@ import tqdm
 
 from semg_jepa.architecture import GaddyRawEMGEncoder
 from semg_jepa.augmentations import RawEMGAugment
+from semg_jepa.cached_dataset import CachedRawEMGDataset, build_batches
 from semg_jepa.data_utils import combine_fixed_length
-from semg_jepa.read_emg import EMGDataset, SizeAwareSampler
+from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
 
 
 class JEPAModel(torch.nn.Module):
@@ -46,8 +46,8 @@ def variance_regularizer(z, eps=1e-4):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-config", required=True)
-    p.add_argument("--output-directory", default="output_jepa_pretrain")
+    p.add_argument("--cache-dir", default="/scratch/cr4206/sEMGencoderJEPA/data")
+    p.add_argument("--output-directory", default="/scratch/cr4206/sEMGencoderJEPA/runs/jepa_pretrain")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--max-batch-len", type=int, default=128000)
     p.add_argument("--fixed-raw-len", type=int, default=1600)
@@ -58,39 +58,54 @@ def parse_args():
     p.add_argument("--model-size", type=int, default=768)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb-entity", default="UMLforVideoLab")
+    p.add_argument("--wandb-project", default="JEPAforsEMG")
+    p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--wandb-tags", nargs="*", default=[])
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
 
 def train(args):
-    with open(args.data_config) as f:
-        data_config = json.load(f)
+    run = init_wandb(args)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    trainset = EMGDataset(data_config, dev=False, test=False)
-    dataloader = torch.utils.data.DataLoader(
-        trainset,
-        pin_memory=(device == "cuda"),
-        num_workers=0,
-        collate_fn=EMGDataset.collate_raw,
-        batch_sampler=SizeAwareSampler(trainset, args.max_batch_len),
-    )
+    trainset = CachedRawEMGDataset(args.cache_dir, "train")
 
-    student = JEPAModel(GaddyRawEMGEncoder(model_size=args.model_size, num_layers=args.num_layers, dropout=args.dropout)).to(device)
+    student = JEPAModel(GaddyRawEMGEncoder(
+        model_size=args.model_size,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    )).to(device)
     teacher = copy.deepcopy(student).to(device)
     for p in teacher.parameters():
         p.requires_grad = False
 
-    weak_aug = RawEMGAugment(channel_dropout=0.05, time_mask_prob=0.2, time_mask_max=20, amp_scale=0.05, noise_std=0.005, temporal_shift=2)
-    strong_aug = RawEMGAugment(channel_dropout=0.2, time_mask_prob=0.7, time_mask_max=80, amp_scale=0.2, noise_std=0.02, temporal_shift=8)
+    weak_aug = RawEMGAugment(
+        channel_dropout=0.05, time_mask_prob=0.2, time_mask_max=20,
+        amp_scale=0.05, noise_std=0.005, temporal_shift=2,
+    )
+    strong_aug = RawEMGAugment(
+        channel_dropout=0.2, time_mask_prob=0.7, time_mask_max=80,
+        amp_scale=0.2, noise_std=0.02, temporal_shift=8,
+    )
 
     optim = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     os.makedirs(args.output_directory, exist_ok=True)
 
     for epoch in range(args.epochs):
+        batches = build_batches(trainset, args.max_batch_len)
+        dataloader = torch.utils.data.DataLoader(
+            trainset,
+            pin_memory=(device == "cuda"),
+            num_workers=0,
+            collate_fn=CachedRawEMGDataset.collate_raw,
+            batch_sampler=batches,
+        )
         running = 0.0
         n = 0
-        for example in tqdm.tqdm(dataloader, desc="JEPA pretrain"):
+        for example in tqdm.tqdm(dataloader, desc=f"JEPA pretrain epoch {epoch + 1}"):
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             student_view = strong_aug(raw)
             teacher_view = weak_aug(raw)
@@ -111,10 +126,13 @@ def train(args):
             running += loss.item()
             n += 1
 
-        logging.info("epoch=%s loss=%.4f", epoch + 1, running / max(1, n))
+        avg_loss = running / max(1, n)
+        logging.info("epoch=%s loss=%.4f", epoch + 1, avg_loss)
+        wandb_log(run, {"epoch": epoch + 1, "train_loss": avg_loss})
         torch.save(student.state_dict(), os.path.join(args.output_directory, "student_last.pt"))
 
     torch.save(student.encoder.state_dict(), os.path.join(args.output_directory, "pretrained_encoder.pt"))
+    finish_wandb(run)
 
 
 if __name__ == "__main__":

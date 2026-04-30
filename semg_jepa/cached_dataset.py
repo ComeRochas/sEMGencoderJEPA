@@ -1,11 +1,37 @@
 from __future__ import annotations
 
+import random
 from copy import copy
 from pathlib import Path
 
 import torch
 
 from .data_utils import TextTransform
+
+
+def build_batches(dataset: "CachedRawEMGDataset", max_len: int) -> list[list[int]]:
+    """Build size-aware batches from a CachedRawEMGDataset.
+
+    Groups examples so total raw_emg samples per batch <= max_len.
+    Returns a shuffled list of index lists (one list per batch).
+    """
+    lengths = [8 * s["ctc_length"] for s in dataset.samples]
+    indices = list(range(len(lengths)))
+    random.shuffle(indices)
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    batch_len = 0
+    for i in indices:
+        if lengths[i] > max_len:
+            continue
+        if batch_len + lengths[i] > max_len and batch:
+            batches.append(batch)
+            batch, batch_len = [], 0
+        batch.append(i)
+        batch_len += lengths[i]
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 class CachedRawEMGDataset(torch.utils.data.Dataset):
@@ -63,8 +89,8 @@ class CachedRawEMGDataset(torch.utils.data.Dataset):
     def collate_raw(batch):
         return {
             "raw_emg": [ex["raw_emg"] for ex in batch],
-            "session_ids": [ex["session_ids"] for ex in batch],
             "lengths": [ex["length"] for ex in batch],
+            "session_ids": [ex["session_ids"] for ex in batch],
             "silent": [ex["silent"] for ex in batch],
             "text_int": [ex["text_int"] for ex in batch],
             "text_int_lengths": [ex["text_int"].shape[0] for ex in batch],
