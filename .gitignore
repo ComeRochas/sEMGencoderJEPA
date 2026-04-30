@@ -4,3 +4,4 @@ logs/
 data/
 .claude
 .codex
+lm.binary

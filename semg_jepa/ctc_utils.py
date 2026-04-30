@@ -2,12 +2,12 @@ import jiwer
 import torch
 import torch.nn.functional as F
 import tqdm
-from ctcdecode import CTCBeamDecoder
+from pyctcdecode import build_ctcdecoder
 
 
 def build_decoder(chars):
-    blank_id = len(chars)
-    return CTCBeamDecoder(chars + "_", blank_id=blank_id, log_probs_input=True, model_path="lm.binary", alpha=1.5, beta=1.85)
+    labels = list(chars) + [""]  # blank at index len(chars)
+    return build_ctcdecoder(labels, kenlm_model_path="lm.binary", alpha=1.5, beta=1.85)
 
 
 def _collate_eval(batch):
@@ -30,11 +30,10 @@ def evaluate(model, dataset, device, batch_size=16):
     with torch.no_grad():
         for raw_padded, seq_lens, texts in tqdm.tqdm(dataloader, "Evaluate", disable=None):
             raw_padded = raw_padded.to(device)
-            log_probs = F.log_softmax(model(raw_padded), -1)
-            beam_results, _, _, out_lens = decoder.decode(log_probs, seq_lens)
+            log_probs = F.log_softmax(model(raw_padded), -1).cpu().numpy()
             for i in range(len(texts)):
-                pred_int = beam_results[i, 0, :out_lens[i, 0]].tolist()
-                predictions.append(dataset.text_transform.int_to_text(pred_int))
+                T = int(seq_lens[i])
+                predictions.append(decoder.decode(log_probs[i, :T]))
                 references.append(dataset.text_transform.clean_text(texts[i]))
     model.train()
     return jiwer.wer(references, predictions), jiwer.cer(references, predictions)

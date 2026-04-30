@@ -72,11 +72,11 @@ CTC blank token = index 37. Vocab size = 38 total.
 All scripts read from `data/*.pt` via `CachedRawEMGDataset`. No live preprocessing.
 
 ```
-precompute_raw_emg.slurm  →  data/{train,dev,test}.pt
-                                      ↓
-train_baseline_cached.slurm     →  runs/baseline/{best,last}.pt
-train_jepa_pretrain_cached.slurm →  runs/jepa_pretrain/pretrained_encoder.pt
-train_jepa_finetune_cached.slurm →  runs/jepa_finetune/{best,last}.pt
+slurm/precompute_raw_emg.slurm  →  data/{train,dev,test}.pt   [already done]
+                                           ↓
+slurm/train_baseline.slurm      →  runs/baseline/{best,last}.pt
+slurm/train_jepa.slurm          →  runs/jepa_pretrain/pretrained_encoder.pt
+slurm/finetune_from_jepa.slurm  →  runs/jepa_finetune/{best,last}.pt
 evaluate_ctc.py                 →  prints WER + CER
 ```
 
@@ -104,11 +104,11 @@ evaluate_ctc.py                 →  prints WER + CER
 
 | Python script | Slurm script | Purpose |
 |--------------|-------------|---------|
-| `train_baseline.py` | `train_baseline_cached.slurm` | Supervised CTC |
-| `train_jepa.py` | `train_jepa_pretrain_cached.slurm` | JEPA pretraining |
-| `finetune_from_jepa.py` | `train_jepa_finetune_cached.slurm` | CTC finetune |
+| `scripts/train_baseline.py` | `slurm/train_baseline.slurm` | Supervised CTC |
+| `scripts/train_jepa.py` | `slurm/train_jepa.slurm` | JEPA pretraining |
+| `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune |
 | `evaluate_ctc.py` | — | WER+CER eval |
-| `scripts/precompute_raw_emg.py` | `precompute_raw_emg.slurm` | Cache builder |
+| `scripts/precompute_raw_emg.py` | `slurm/precompute_raw_emg.slurm` | Cache builder |
 
 ## Output directories (all under /scratch/cr4206/sEMGencoderJEPA/)
 
@@ -127,12 +127,12 @@ evaluate_ctc.py                 →  prints WER + CER
 sbatch slurm/precompute_raw_emg.slurm
 
 # Train baseline
-sbatch slurm/train_baseline_cached.slurm
+sbatch slurm/train_baseline.slurm
 
 # JEPA pretrain then finetune
-sbatch slurm/train_jepa_pretrain_cached.slurm
+sbatch slurm/train_jepa.slurm
 # wait for pretrained_encoder.pt, then:
-sbatch slurm/train_jepa_finetune_cached.slurm
+sbatch slurm/finetune_from_jepa.slurm
 
 # Evaluate
 PYTHONPATH=/scratch/cr4206/sEMGencoderJEPA \
@@ -140,7 +140,7 @@ PYTHONPATH=/scratch/cr4206/sEMGencoderJEPA \
   --checkpoint runs/baseline/best.pt
 
 # Override output dir at submission
-OUTPUT_DIR=runs/baseline_v2 sbatch slurm/train_baseline_cached.slurm
+OUTPUT_DIR=runs/baseline_v2 sbatch slurm/train_baseline.slurm
 ```
 
 ## Key design decisions

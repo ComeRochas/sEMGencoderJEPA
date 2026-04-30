@@ -4,7 +4,7 @@ EMG-to-text silent speech framework based on [Gaddy & Klein (2021)](https://gith
 
 Three training pipelines:
 1. **Baseline CTC** — supervised, raw EMG → characters
-2. **JEPA pretraining** — self-supervised student/teacher encoder
+2. **JEPA pretraining** — self-supervised student/teacher encoder (BYOL-style)
 3. **JEPA fine-tuning** — CTC head on pretrained encoder
 
 ## Setup
@@ -16,7 +16,7 @@ PYTHON=/scratch/cr4206/envs/silent_speech/bin/python
 
 ## Workflow
 
-### 1. Precompute cache (once)
+### 1. Precompute cache (already done)
 
 ```bash
 sbatch slurm/precompute_raw_emg.slurm
@@ -27,18 +27,18 @@ sbatch slurm/precompute_raw_emg.slurm
 
 ```bash
 # Baseline CTC (200 epochs)
-sbatch slurm/train_baseline_cached.slurm
+sbatch slurm/train_baseline.slurm
 
 # JEPA self-supervised pretraining (100 epochs)
-sbatch slurm/train_jepa_pretrain_cached.slurm
+sbatch slurm/train_jepa.slurm
 
 # Fine-tune CTC from JEPA encoder (80 epochs, after pretraining)
-sbatch slurm/train_jepa_finetune_cached.slurm
+sbatch slurm/finetune_from_jepa.slurm
 ```
 
 Override any variable at submission time:
 ```bash
-OUTPUT_DIR=/scratch/cr4206/sEMGencoderJEPA/runs/baseline_v2 sbatch slurm/train_baseline_cached.slurm
+OUTPUT_DIR=/scratch/cr4206/sEMGencoderJEPA/runs/baseline_v2 sbatch slurm/train_baseline.slurm
 ```
 
 ### 3. Evaluate
@@ -52,9 +52,9 @@ $PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt --split dev
 
 | File | Purpose |
 |------|---------|
-| `train_baseline.py` | Supervised CTC baseline |
-| `train_jepa.py` | JEPA self-supervised pretraining |
-| `finetune_from_jepa.py` | CTC fine-tune from JEPA encoder |
+| `scripts/train_baseline.py` | Supervised CTC baseline |
+| `scripts/train_jepa.py` | JEPA self-supervised pretraining |
+| `scripts/finetune_from_jepa.py` | CTC fine-tune from JEPA encoder |
 | `evaluate_ctc.py` | WER + CER evaluation |
 | `scripts/precompute_raw_emg.py` | Precompute raw EMG cache |
 
