@@ -2,6 +2,7 @@ import argparse
 import copy
 import logging
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ import tqdm
 from semg_jepa.architecture import GaddyRawEMGEncoder
 from semg_jepa.augmentations import RawEMGAugment
 from semg_jepa.cached_dataset import CachedRawEMGDataset, build_batches
+from semg_jepa.config_utils import parse_with_config, setup_stdout_logging
 from semg_jepa.data_utils import combine_fixed_length
 from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
 
@@ -46,6 +48,7 @@ def variance_regularizer(z, eps=1e-4):
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--config", default=None, help="Path to YAML config; CLI flags override its values.")
     p.add_argument("--cache-dir", default="/scratch/cr4206/sEMGencoderJEPA/data")
     p.add_argument("--output-directory", default="/scratch/cr4206/sEMGencoderJEPA/runs/jepa_pretrain")
     p.add_argument("--epochs", type=int, default=100)
@@ -64,11 +67,11 @@ def parse_args():
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--wandb-tags", nargs="*", default=[])
     p.add_argument("--cpu", action="store_true")
-    return p.parse_args()
+    return parse_with_config(p)
 
 
 def train(args):
-    run = init_wandb(args)
+    run = init_wandb(args, default_name_prefix="jepa")
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     trainset = CachedRawEMGDataset(args.cache_dir, "train")
@@ -93,6 +96,7 @@ def train(args):
 
     optim = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     os.makedirs(args.output_directory, exist_ok=True)
+    run_ts = time.strftime("%Y%m%d_%H%M")
 
     for epoch in range(args.epochs):
         batches = build_batches(trainset, args.max_batch_len)
@@ -105,6 +109,7 @@ def train(args):
         )
         running = 0.0
         n = 0
+        epoch_start = time.perf_counter()
         for example in tqdm.tqdm(dataloader, desc=f"JEPA pretrain epoch {epoch + 1}"):
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             student_view = strong_aug(raw)
@@ -127,14 +132,21 @@ def train(args):
             n += 1
 
         avg_loss = running / max(1, n)
-        logging.info("epoch=%s loss=%.4f", epoch + 1, avg_loss)
-        wandb_log(run, {"epoch": epoch + 1, "train_loss": avg_loss})
+        t_epoch = time.perf_counter() - epoch_start
+        logging.info("epoch=%d/%d loss=%.4f t_epoch=%.1fs", epoch + 1, args.epochs, avg_loss, t_epoch)
+        wandb_log(run, {
+            "train/loss": avg_loss,
+            "time/epoch": t_epoch,
+            "epoch": epoch + 1,
+        })
         torch.save(student.state_dict(), os.path.join(args.output_directory, "student_last.pt"))
+        torch.save(student.state_dict(), os.path.join(args.output_directory, f"student_last_{run_ts}.pt"))
 
     torch.save(student.encoder.state_dict(), os.path.join(args.output_directory, "pretrained_encoder.pt"))
+    torch.save(student.encoder.state_dict(), os.path.join(args.output_directory, f"pretrained_encoder_{run_ts}.pt"))
     finish_wandb(run)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    setup_stdout_logging()
     train(parse_args())

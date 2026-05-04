@@ -43,9 +43,18 @@ OUTPUT_DIR=/scratch/cr4206/sEMGencoderJEPA/runs/baseline_v2 sbatch slurm/train_b
 
 ### 3. Evaluate
 
+Defaults: split=`test`, method=`beam`, grid-search on (tunes `beam_width × alpha × beta` on dev, then evaluates test with the best combo).
+
 ```bash
-$PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt           # test set
-$PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt --split dev
+sbatch slurm/evaluate.slurm                                                    # default checkpoint
+CHECKPOINTS="runs/baseline/best.pt runs/jepa_finetune/best.pt" \
+  sbatch slurm/evaluate.slurm                                                  # multiple at once
+GRID_SEARCH=0 SPLIT=dev METHOD=greedy sbatch slurm/evaluate.slurm              # quick check
+```
+
+Direct invocation:
+```bash
+$PYTHON scripts/evaluate.py --checkpoints runs/baseline/best.pt --split dev --method greedy
 ```
 
 ## Scripts
@@ -55,7 +64,7 @@ $PYTHON evaluate_ctc.py --checkpoint runs/baseline/best.pt --split dev
 | `scripts/train_baseline.py` | Supervised CTC baseline |
 | `scripts/train_jepa.py` | JEPA self-supervised pretraining |
 | `scripts/finetune_from_jepa.py` | CTC fine-tune from JEPA encoder |
-| `evaluate_ctc.py` | WER + CER evaluation |
+| `scripts/evaluate.py` | WER + CER evaluation (greedy/beam, optional dev grid search) |
 | `scripts/precompute_raw_emg.py` | Precompute raw EMG cache |
 
 ## W&B
@@ -64,6 +73,9 @@ All training scripts support `--wandb` (offline by default; set `WANDB_MODE=onli
 Entity: `UMLforVideoLab` · Project: `JEPAforsEMG`
 
 To sync offline runs:
+```bash
+wandb sync runs/baseline/wandb/
+```
 ```bash
 wandb sync runs/baseline/wandb/
 ```

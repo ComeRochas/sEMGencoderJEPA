@@ -10,6 +10,7 @@ from torch import nn
 
 from semg_jepa.architecture import BaselineCTCModel
 from semg_jepa.cached_dataset import CachedRawEMGDataset, build_batches
+from semg_jepa.config_utils import parse_with_config, setup_stdout_logging
 from semg_jepa.ctc_utils import evaluate
 from semg_jepa.data_utils import combine_fixed_length, decollate_tensor
 from semg_jepa.wandb_utils import finish_wandb, init_wandb, wandb_log
@@ -21,7 +22,7 @@ def _sync(device):
 
 
 def train(args):
-    run = init_wandb(args)
+    run = init_wandb(args, default_name_prefix="baseline")
 
     trainset = CachedRawEMGDataset(args.cache_dir, "train")
     devset = CachedRawEMGDataset(args.cache_dir, "dev")
@@ -51,6 +52,7 @@ def train(args):
             set_lr(iteration * args.learning_rate / args.learning_rate_warmup)
 
     os.makedirs(args.output_directory, exist_ok=True)
+    run_ts = time.strftime("%Y%m%d_%H%M")
     best_wer = float("inf")
     global_step = 0
     optim.zero_grad()
@@ -104,7 +106,7 @@ def train(args):
         train_loss = float(np.mean(losses)) if losses else 0.0
 
         eval_start = time.perf_counter()
-        wer, cer = evaluate(model, devset, device)
+        wer, cer = evaluate(model, devset, device, method=args.eval_method)
         t_eval = time.perf_counter() - eval_start
 
         lr_sched.step()
@@ -112,28 +114,32 @@ def train(args):
         cur_lr = optim.param_groups[0]["lr"]
 
         logging.info(
-            "epoch=%d steps=%d lr=%.2e train_loss=%.4f dev_wer=%.3f dev_cer=%.3f "
+            "epoch=%d/%d steps=%d lr=%.2e train_loss=%.4f dev_wer=%.3f dev_cer=%.3f "
             "t_data=%.1fs t_fwd=%.1fs t_bwd=%.1fs t_opt=%.1fs t_eval=%.1fs t_epoch=%.1fs",
-            epoch + 1, n_steps, cur_lr, train_loss, wer, cer,
+            epoch + 1, args.epochs, n_steps, cur_lr, train_loss, wer, cer,
             t["data"], t["fwd"], t["bwd"], t["opt"], t_eval, t_epoch,
         )
         wandb_log(run, {
-            "epoch": epoch + 1, "train_loss": train_loss, "dev_wer": wer, "dev_cer": cer,
-            "lr": cur_lr,
-            "t_data": t["data"], "t_fwd": t["fwd"], "t_bwd": t["bwd"], "t_opt": t["opt"],
-            "t_eval": t_eval, "t_epoch": t_epoch,
+            "eval/wer": wer, "eval/cer": cer,
+            "train/loss": train_loss, "train/lr": cur_lr,
+            "time/data": t["data"], "time/fwd": t["fwd"], "time/bwd": t["bwd"], "time/opt": t["opt"],
+            "time/eval": t_eval, "time/epoch": t_epoch,
+            "epoch": epoch + 1,
         })
 
         torch.save(model.state_dict(), os.path.join(args.output_directory, "last.pt"))
+        torch.save(model.state_dict(), os.path.join(args.output_directory, f"last_{run_ts}.pt"))
         if wer < best_wer:
             best_wer = wer
             torch.save(model.state_dict(), os.path.join(args.output_directory, "best.pt"))
+            torch.save(model.state_dict(), os.path.join(args.output_directory, f"best_{run_ts}.pt"))
 
     finish_wandb(run)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--config", default=None, help="Path to YAML config; CLI flags override its values.")
     p.add_argument("--cache-dir", default="/scratch/cr4206/sEMGencoderJEPA/data")
     p.add_argument("--output-directory", default="/scratch/cr4206/sEMGencoderJEPA/runs/baseline")
     p.add_argument("--epochs", type=int, default=200)
@@ -147,15 +153,16 @@ def parse_args():
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--start-training-from", default=None)
+    p.add_argument("--eval-method", choices=["greedy", "beam"], default="greedy")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-entity", default="UMLforVideoLab")
     p.add_argument("--wandb-project", default="JEPAforsEMG")
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--wandb-tags", nargs="*", default=[])
     p.add_argument("--cpu", action="store_true")
-    return p.parse_args()
+    return parse_with_config(p)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    setup_stdout_logging()
     train(parse_args())

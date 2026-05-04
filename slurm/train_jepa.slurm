@@ -26,6 +26,7 @@ echo "[train_jepa] job=${SLURM_JOB_ID:-manual} host=$(hostname) start=$(date -Is
 echo "[train_jepa] cache_dir=$CACHE_DIR output_dir=$OUTPUT_DIR"
 
 "$PYTHON" -u scripts/train_jepa.py \
+  --config configs/train_jepa.yaml \
   --cache-dir "$CACHE_DIR" \
   --output-directory "$OUTPUT_DIR" \
   --wandb

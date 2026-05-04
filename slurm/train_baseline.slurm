@@ -26,6 +26,7 @@ echo "[train_baseline] job=${SLURM_JOB_ID:-manual} host=$(hostname) start=$(date
 echo "[train_baseline] cache_dir=$CACHE_DIR output_dir=$OUTPUT_DIR"
 
 "$PYTHON" -u scripts/train_baseline.py \
+  --config configs/train_baseline.yaml \
   --cache-dir "$CACHE_DIR" \
   --output-directory "$OUTPUT_DIR" \
   --wandb

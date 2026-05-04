@@ -1,0 +1,28 @@
+# Defaults for scripts/finetune_from_jepa.py.
+# CLI flags override these; these override script-level defaults.
+
+cache_dir: /scratch/cr4206/sEMGencoderJEPA/data
+output_directory: /scratch/cr4206/sEMGencoderJEPA/runs/jepa_finetune
+
+# pretrained_encoder must be supplied via CLI (no sensible default).
+pretrained_encoder: /scratch/cr4206/sEMGencoderJEPA/runs/jepa_pretrain/pretrained_encoder.pt
+
+epochs: 80
+max_batch_len: 128000
+fixed_raw_len: 1600
+
+learning_rate: 2.0e-4
+weight_decay: 0.0
+freeze_encoder: false
+
+model_size: 768
+num_layers: 6
+dropout: 0.2
+
+eval_method: greedy   # greedy (fast, no LM) or beam (slow, LM if available)
+
+wandb: false
+wandb_entity: UMLforVideoLab
+wandb_project: JEPAforsEMG
+wandb_run_name: null
+wandb_tags: []

@@ -10,7 +10,7 @@
 - [ ] Run `sbatch slurm/train_baseline.slurm` for a quick smoke test
 - [ ] Confirm WER and CER are logged to stdout and W&B
 - [ ] Confirm checkpoints save `best.pt` by WER and `last.pt` every epoch
-- [ ] Confirm `evaluate_ctc.py` reports both WER and CER
+- [ ] Confirm `scripts/evaluate.py` reports both WER and CER
 
 ## B. Baseline experiments
 - [ ] Train full-data CTC baseline → `runs/baseline/`
@@ -32,7 +32,7 @@
 - [ ] Compare: CTC-only / JEPA pretrain+finetune / joint CTC+JEPA
 
 ## F. Robustness experiments
-- [ ] Add test-time corruption options to `evaluate_ctc.py` (channel dropout, noise, time mask)
+- [ ] Add test-time corruption options to `scripts/evaluate.py` (channel dropout, noise, time mask)
 - [ ] Evaluate baseline and JEPA models under one/two dropped channels
 - [ ] Plot WER/CER degradation curves
 

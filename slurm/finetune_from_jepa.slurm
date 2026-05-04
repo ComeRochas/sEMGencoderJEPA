@@ -27,6 +27,7 @@ echo "[finetune_from_jepa] job=${SLURM_JOB_ID:-manual} host=$(hostname) start=$(
 echo "[finetune_from_jepa] cache_dir=$CACHE_DIR output_dir=$OUTPUT_DIR pretrained_encoder=$PRETRAINED_ENCODER"
 
 "$PYTHON" -u scripts/finetune_from_jepa.py \
+  --config configs/finetune_from_jepa.yaml \
   --cache-dir "$CACHE_DIR" \
   --pretrained-encoder "$PRETRAINED_ENCODER" \
   --output-directory "$OUTPUT_DIR" \

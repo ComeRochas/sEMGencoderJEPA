@@ -1,22 +1,59 @@
+import multiprocessing
+import os
+from itertools import product
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+import tqdm
 from pyctcdecode import build_ctcdecoder
 
+from semg_jepa.data_utils import TextTransform
 from semg_jepa.metrics import compute_cer, compute_wer
 
 
-def build_decoder(chars):
-    labels = list(chars) + [""]  # blank at index len(chars)
+def load_unigrams(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def build_unigrams_from_cache(cache_path, out_path):
+    """Extract unique words from a precomputed split (.pt) into out_path."""
+    payload = torch.load(cache_path, map_location="cpu")
+    tt = TextTransform()
+    words: set[str] = set()
+    for sample in payload["samples"]:
+        words.update(tt.clean_text(sample["text"]).split())
+    Path(out_path).write_text("\n".join(sorted(words)) + "\n")
+    print(f"[ctc_utils] wrote {len(words)} unigrams to {out_path}", flush=True)
+
+
+def build_decoder(chars, lm_path="data/lm.binary", unigrams_path="data/unigrams.txt",
+                  alpha=1.5, beta=1.85):
+    labels = list(chars) + [""]   # blank last, aligned with logits
+
+    kwargs = {}
+    if Path(lm_path).exists():
+        kwargs["kenlm_model_path"] = lm_path
+        kwargs["alpha"] = alpha
+        kwargs["beta"] = beta
+
+    if Path(unigrams_path).exists():
+        kwargs["unigrams"] = load_unigrams(unigrams_path)
+
     try:
-        return build_ctcdecoder(labels, kenlm_model_path="data/lm.binary", alpha=1.5, beta=1.85)
+        return build_ctcdecoder(labels, **kwargs)
     except Exception as e:
-        print(f"[ctc_utils] LM-backed decoder unavailable ({type(e).__name__}: {e}); "
-              f"falling back to no-LM beam search. WER will be higher.", flush=True)
+        print(
+            f"[ctc_utils] decoder build failed ({type(e).__name__}: {e}); "
+            f"falling back to no-LM beam search.",
+            flush=True
+        )
         return build_ctcdecoder(labels)
 
 
 def _collate_eval(batch):
-    """Pad raw_emg sequences to the longest in the batch."""
     raw_list = [ex["raw_emg"] for ex in batch]
     seq_lens = torch.tensor([r.shape[0] // 8 for r in raw_list])
     raw_padded = torch.nn.utils.rnn.pad_sequence(raw_list, batch_first=True)
@@ -24,21 +61,90 @@ def _collate_eval(batch):
     return raw_padded, seq_lens, texts
 
 
-def evaluate(model, dataset, device, batch_size=16):
-    """Return (wer, cer) on dataset using batched CTC beam-search decoding."""
+def _greedy_collapse(int_seq, blank_id):
+    out = []
+    prev = -1
+    for p in int_seq:
+        if p != prev and p != blank_id:
+            out.append(p)
+        prev = p
+    return out
+
+
+def compute_log_probs(model, dataset, device, batch_size=None):
+    """Single batched forward pass. Returns (log_probs_list, references)."""
     model.eval()
-    decoder = build_decoder(dataset.text_transform.chars)
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, collate_fn=_collate_eval,
-    )
-    references, predictions = [], []
+    on_gpu = str(device).startswith("cuda")
+    bs = batch_size if batch_size is not None else (16 if on_gpu else 1)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=bs, collate_fn=_collate_eval)
+
+    log_probs_list, references = [], []
     with torch.no_grad():
-        for raw_padded, seq_lens, texts in dataloader:
+        for raw_padded, seq_lens, texts in tqdm.tqdm(dataloader, "Forward", disable=None):
             raw_padded = raw_padded.to(device)
-            log_probs = F.log_softmax(model(raw_padded), -1).cpu().numpy()
-            for i in range(len(texts)):
-                T = int(seq_lens[i])
-                predictions.append(decoder.decode(log_probs[i, :T]))
+            lp = F.log_softmax(model(raw_padded), -1).cpu()
+            for i, T in enumerate(seq_lens.tolist()):
+                log_probs_list.append(lp[i, :T].numpy().astype(np.float32))
                 references.append(dataset.text_transform.clean_text(texts[i]))
     model.train()
+    return log_probs_list, references
+
+
+def _decode_beam(log_probs_list, decoder, beam_width, num_workers=None):
+    n_workers = min(num_workers or os.cpu_count() or 4, 16)
+    with multiprocessing.pool.Pool(n_workers) as pool:
+        return decoder.decode_batch(pool, log_probs_list, beam_width=beam_width)
+
+
+def evaluate(model, dataset, device, method="greedy", batch_size=None,
+             beam_width=100, alpha=1.5, beta=1.85,
+             lm_path="data/lm.binary", unigrams_path="data/unigrams.txt",
+             num_workers=None):
+    """Return (wer, cer).
+
+    method="greedy": batched GPU argmax + CTC collapse. Fast (~1s).
+    method="beam":   batched GPU forward + parallel pyctcdecode beam search.
+                     num_workers controls pool size (default: all CPUs, max 16).
+    """
+    if method not in ("greedy", "beam"):
+        raise ValueError(f"unknown eval method: {method}")
+
+    log_probs_list, references = compute_log_probs(model, dataset, device, batch_size)
+
+    if method == "greedy":
+        blank_id = len(dataset.text_transform.chars)
+        predictions = [
+            dataset.text_transform.int_to_text(_greedy_collapse(lp.argmax(-1).tolist(), blank_id))
+            for lp in log_probs_list
+        ]
+    else:
+        decoder = build_decoder(dataset.text_transform.chars,
+                                lm_path=lm_path, unigrams_path=unigrams_path,
+                                alpha=alpha, beta=beta)
+        predictions = _decode_beam(log_probs_list, decoder, beam_width, num_workers)
+
     return compute_wer(references, predictions), compute_cer(references, predictions)
+
+
+def grid_search(model, dataset, device, beam_widths, alphas, betas,
+                lm_path="data/lm.binary", unigrams_path="data/unigrams.txt",
+                batch_size=None, num_workers=None):
+    """Run beam search over a grid of (beam_width, alpha, beta).
+
+    Forward pass runs once; only decoders are rebuilt per combo. Returns a list
+    of (beam_width, alpha, beta, wer, cer) sorted by ascending WER.
+    """
+    log_probs_list, references = compute_log_probs(model, dataset, device, batch_size)
+
+    results = []
+    combos = list(product(alphas, betas, beam_widths))
+    for alpha, beta, bw in tqdm.tqdm(combos, "GridSearch", disable=None):
+        decoder = build_decoder(dataset.text_transform.chars,
+                                lm_path=lm_path, unigrams_path=unigrams_path,
+                                alpha=alpha, beta=beta)
+        preds = _decode_beam(log_probs_list, decoder, bw, num_workers)
+        wer = compute_wer(references, preds)
+        cer = compute_cer(references, preds)
+        results.append((bw, alpha, beta, wer, cer))
+    results.sort(key=lambda r: r[3])
+    return results

@@ -77,7 +77,7 @@ slurm/precompute_raw_emg.slurm  →  data/{train,dev,test}.pt   [already done]
 slurm/train_baseline.slurm      →  runs/baseline/{best,last}.pt
 slurm/train_jepa.slurm          →  runs/jepa_pretrain/pretrained_encoder.pt
 slurm/finetune_from_jepa.slurm  →  runs/jepa_finetune/{best,last}.pt
-evaluate_ctc.py                 →  prints WER + CER
+slurm/evaluate.slurm            →  prints WER + CER (optionally grid-searches LM hyperparams on dev)
 ```
 
 `build_batches(dataset, max_len)` in `cached_dataset.py` builds size-aware batches (total raw_emg samples ≤ max_len). Called fresh each epoch for reshuffling.
@@ -86,10 +86,11 @@ evaluate_ctc.py                 →  prints WER + CER
 
 ## Evaluation
 
-`evaluate(model, dataset, device, batch_size=16)` in `ctc_utils.py`:
-- Batched evaluation (batch_size=16, sequences padded to max length in batch)
-- `seq_lens` passed to CTCBeamDecoder so it ignores padded frames
-- CTC beam search with language model (`lm.binary`, alpha=1.5, beta=1.85)
+`evaluate(model, dataset, device, method, ...)` in `ctc_utils.py`:
+- Internally splits into `compute_log_probs` (one batched GPU forward) + decode step
+- `method="greedy"`: GPU argmax + CTC collapse — fast (~2s on 200 samples)
+- `method="beam"`: pyctcdecode + KenLM (`data/lm.binary`) + unigrams (`data/unigrams.txt`, auto-built from train set if missing); decoded in parallel on CPU pool — ~25–90s on 200 samples
+- `grid_search(...)`: one forward pass, then iterates over `(beam_width, alpha, beta)` combos reusing the cached log_probs. Used by `scripts/evaluate.py --grid-search` to tune on dev before reporting test
 - Returns `(wer, cer)` — both logged during training
 
 ## W&B logging
@@ -107,7 +108,7 @@ evaluate_ctc.py                 →  prints WER + CER
 | `scripts/train_baseline.py` | `slurm/train_baseline.slurm` | Supervised CTC |
 | `scripts/train_jepa.py` | `slurm/train_jepa.slurm` | JEPA pretraining |
 | `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune |
-| `evaluate_ctc.py` | — | WER+CER eval |
+| `scripts/evaluate.py` | `slurm/evaluate.slurm` | WER+CER eval (greedy/beam, optional grid search) |
 | `scripts/precompute_raw_emg.py` | `slurm/precompute_raw_emg.slurm` | Cache builder |
 
 ## Output directories (all under /scratch/cr4206/sEMGencoderJEPA/)
@@ -134,10 +135,12 @@ sbatch slurm/train_jepa.slurm
 # wait for pretrained_encoder.pt, then:
 sbatch slurm/finetune_from_jepa.slurm
 
-# Evaluate
-PYTHONPATH=/scratch/cr4206/sEMGencoderJEPA \
-  /scratch/cr4206/envs/silent_speech/bin/python evaluate_ctc.py \
-  --checkpoint runs/baseline/best.pt
+# Evaluate (single checkpoint, defaults: split=test, method=beam, grid_search=on)
+sbatch slurm/evaluate.slurm
+# Multiple checkpoints in one job
+CHECKPOINTS="runs/baseline/best.pt runs/jepa_finetune/best.pt" sbatch slurm/evaluate.slurm
+# Disable grid search
+GRID_SEARCH=0 sbatch slurm/evaluate.slurm
 
 # Override output dir at submission
 OUTPUT_DIR=runs/baseline_v2 sbatch slurm/train_baseline.slurm
