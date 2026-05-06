@@ -6,3 +6,6 @@ data/
 .codex
 wandb/
 runs/
+gaddy_original/
+slurm/precompute_gaddy_cache.slurm
+slurm/train_gaddy.slurm

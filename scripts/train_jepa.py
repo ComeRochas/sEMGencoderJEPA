@@ -110,7 +110,7 @@ def train(args):
         running = 0.0
         n = 0
         epoch_start = time.perf_counter()
-        for example in tqdm.tqdm(dataloader, desc=f"JEPA pretrain epoch {epoch + 1}"):
+        for example in tqdm.tqdm(dataloader, desc=f"JEPA pretrain epoch {epoch + 1}", disable=True):
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             student_view = strong_aug(raw)
             teacher_view = weak_aug(raw)
