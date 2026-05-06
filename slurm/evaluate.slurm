@@ -17,7 +17,7 @@ PYTHON=${PYTHON:-/scratch/cr4206/envs/silent_speech/bin/python}
 CACHE_DIR=${CACHE_DIR:-/scratch/cr4206/sEMGencoderJEPA/data}
 SPLIT=${SPLIT:-test}
 METHOD=${METHOD:-beam}
-GRID_SEARCH=${GRID_SEARCH:-1}     # 1 = on, 0 = off
+GRID_SEARCH=${GRID_SEARCH:-0}     # 1 = on, 0 = off
 
 # Edit this list to evaluate multiple checkpoints in one job.
 # Override from CLI: CHECKPOINTS="runs/a/best.pt runs/b/best.pt" sbatch slurm/evaluate.slurm

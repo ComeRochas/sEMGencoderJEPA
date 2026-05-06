@@ -7,7 +7,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
+
+# Import kenlm BEFORE pyctcdecode and inject it into pyctcdecode's namespace.
+# pyctcdecode does `try: import kenlm except: ...` at module load — on compute
+# nodes that import sometimes fails silently (different system libs from the
+# login node), leaving `kenlm` undefined inside pyctcdecode. We force-inject it
+# here so `kenlm.Model(...)` works downstream.
+try:
+    import kenlm
+except ImportError:
+    kenlm = None
+
+import pyctcdecode.decoder as _pyctc_decoder
 from pyctcdecode import build_ctcdecoder
+
+if kenlm is not None and not hasattr(_pyctc_decoder, "kenlm"):
+    _pyctc_decoder.kenlm = kenlm
 
 from semg_jepa.data_utils import TextTransform
 from semg_jepa.metrics import compute_cer, compute_wer
@@ -29,28 +44,50 @@ def build_unigrams_from_cache(cache_path, out_path):
     print(f"[ctc_utils] wrote {len(words)} unigrams to {out_path}", flush=True)
 
 
+_lm_available = None
+_cached_unigrams = {}
+
+
+def _check_lm_available(lm_path):
+    """Check if KenLM can be loaded (cached result)."""
+    global _lm_available
+    if _lm_available is not None:
+        return _lm_available
+
+    if not Path(lm_path).exists():
+        _lm_available = False
+        return False
+
+    try:
+        from pyctcdecode import build_ctcdecoder
+        labels = ["a", ""]  # dummy test
+        _ = build_ctcdecoder(labels, kenlm_model_path=lm_path)
+        _lm_available = True
+        print("[ctc_utils] KenLM loaded successfully", flush=True)
+        return True
+    except Exception as e:
+        _lm_available = False
+        print(f"[ctc_utils] KenLM unavailable ({type(e).__name__}: {e}); using beam search without LM", flush=True)
+        return False
+
+
 def build_decoder(chars, lm_path="data/lm.binary", unigrams_path="data/unigrams.txt",
                   alpha=1.5, beta=1.85):
     labels = list(chars) + [""]   # blank last, aligned with logits
 
     kwargs = {}
-    if Path(lm_path).exists():
+    if _check_lm_available(lm_path):
         kwargs["kenlm_model_path"] = lm_path
         kwargs["alpha"] = alpha
         kwargs["beta"] = beta
 
-    if Path(unigrams_path).exists():
-        kwargs["unigrams"] = load_unigrams(unigrams_path)
+    if Path(unigrams_path).exists() and "unigrams" not in _cached_unigrams:
+        _cached_unigrams["unigrams"] = load_unigrams(unigrams_path)
 
-    try:
-        return build_ctcdecoder(labels, **kwargs)
-    except Exception as e:
-        print(
-            f"[ctc_utils] decoder build failed ({type(e).__name__}: {e}); "
-            f"falling back to no-LM beam search.",
-            flush=True
-        )
-        return build_ctcdecoder(labels)
+    if "unigrams" in _cached_unigrams:
+        kwargs["unigrams"] = _cached_unigrams["unigrams"]
+
+    return build_ctcdecoder(labels, **kwargs)
 
 
 def _collate_eval(batch):

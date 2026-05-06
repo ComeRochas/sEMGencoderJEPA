@@ -38,10 +38,10 @@ class RawEMGAugment:
             for i in range(b):
                 shift = random.randint(-self.temporal_shift, self.temporal_shift)
                 if shift > 0:
-                    out[i, shift:, :] = out[i, :-shift, :]
+                    out[i, shift:, :] = out[i, :-shift, :].clone()
                     out[i, :shift, :] = 0
                 elif shift < 0:
                     k = -shift
-                    out[i, :-k, :] = out[i, k:, :]
+                    out[i, :-k, :] = out[i, k:, :].clone()
                     out[i, -k:, :] = 0
         return out
