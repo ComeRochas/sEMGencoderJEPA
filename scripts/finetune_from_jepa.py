@@ -6,7 +6,6 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-import tqdm
 from torch import nn
 
 from semg_jepa.architecture import CTCHead, GaddyRawEMGEncoder
@@ -37,6 +36,9 @@ def parse_args():
     p.add_argument("--max-batch-len", type=int, default=128000)
     p.add_argument("--fixed-raw-len", type=int, default=1600)
     p.add_argument("--learning-rate", type=float, default=2e-4)
+    p.add_argument("--learning-rate-warmup", type=int, default=500)
+    p.add_argument("--lr-decay-milestones", type=int, nargs="+", default=[50, 60, 70])
+    p.add_argument("--lr-decay-gamma", type=float, default=0.5)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--model-size", type=int, default=768)
@@ -74,9 +76,23 @@ def train(args):
 
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    lr_sched = torch.optim.lr_scheduler.MultiStepLR(
+        optim, milestones=args.lr_decay_milestones, gamma=args.lr_decay_gamma
+    )
+
+    def set_lr(new_lr):
+        for param_group in optim.param_groups:
+            param_group["lr"] = new_lr
+
+    def schedule_lr(iteration):
+        iteration += 1
+        if iteration <= args.learning_rate_warmup:
+            set_lr(iteration * args.learning_rate / args.learning_rate_warmup)
+
     os.makedirs(args.output_directory, exist_ok=True)
     run_ts = time.strftime("%Y%m%d_%H%M")
     best_wer = float("inf")
+    global_step = 0
 
     for epoch in range(args.epochs):
         batches = build_batches(trainset, args.max_batch_len)
@@ -89,7 +105,9 @@ def train(args):
         )
         losses = []
         epoch_start = time.perf_counter()
-        for example in tqdm.tqdm(dataloader, desc=f"Finetune epoch {epoch + 1}"):
+        for example in dataloader:
+            schedule_lr(global_step)
+
             raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
             pred = F.log_softmax(model(raw), dim=-1)
             pred = nn.utils.rnn.pad_sequence(decollate_tensor(pred, example["lengths"]), batch_first=False)
@@ -100,19 +118,24 @@ def train(args):
             loss.backward()
             optim.step()
             losses.append(loss.item())
+            global_step += 1
 
         train_loss = float(np.mean(losses)) if losses else 0.0
         eval_start = time.perf_counter()
         wer, cer = evaluate(model, devset, device, method=args.eval_method)
         t_eval = time.perf_counter() - eval_start
+
+        lr_sched.step()
         t_epoch = time.perf_counter() - epoch_start
+        cur_lr = optim.param_groups[0]["lr"]
+
         logging.info(
-            "epoch=%d/%d train_loss=%.4f dev_wer=%.3f dev_cer=%.3f t_eval=%.1fs t_epoch=%.1fs",
-            epoch + 1, args.epochs, train_loss, wer, cer, t_eval, t_epoch,
+            "epoch=%d/%d lr=%.2e train_loss=%.4f dev_wer=%.3f dev_cer=%.3f t_eval=%.1fs t_epoch=%.1fs",
+            epoch + 1, args.epochs, cur_lr, train_loss, wer, cer, t_eval, t_epoch,
         )
         wandb_log(run, {
             "eval/wer": wer, "eval/cer": cer,
-            "train/loss": train_loss,
+            "train/loss": train_loss, "train/lr": cur_lr,
             "time/eval": t_eval, "time/epoch": t_epoch,
             "epoch": epoch + 1,
         })

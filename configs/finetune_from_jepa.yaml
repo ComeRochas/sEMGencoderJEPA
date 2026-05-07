@@ -5,13 +5,15 @@ cache_dir: /scratch/cr4206/sEMGencoderJEPA/data
 output_directory: /scratch/cr4206/sEMGencoderJEPA/runs/jepa_finetune
 
 # pretrained_encoder must be supplied via CLI (no sensible default).
-pretrained_encoder: /scratch/cr4206/sEMGencoderJEPA/runs/jepa_pretrain/pretrained_encoder.pt
-
-epochs: 80
+pretrained_encoder: /scratch/cr4206/sEMGencoderJEPA/runs/jepa_pretrain/pretrained_encoder_20260507_1303.pt
+epochs: 200
 max_batch_len: 128000
 fixed_raw_len: 1600
 
 learning_rate: 2.0e-4
+learning_rate_warmup: 500
+lr_decay_milestones: [125, 150, 175]   # mirrors baseline's [125,150,175] @ 200 epochs, scaled to 200 epochs
+lr_decay_gamma: 0.5
 weight_decay: 0.0
 freeze_encoder: false
 
