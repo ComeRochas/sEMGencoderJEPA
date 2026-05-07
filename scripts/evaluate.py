@@ -1,14 +1,13 @@
 import argparse
-from pathlib import Path
 
 import torch
 
 from semg_jepa.architecture import BaselineCTCModel
 from semg_jepa.cached_dataset import CachedRawEMGDataset
-from semg_jepa.ctc_utils import build_unigrams_from_cache, evaluate, grid_search
+from semg_jepa.ctc_utils import evaluate, grid_search
 
-GRID_BEAM_WIDTHS = [25, 50, 100, 200]
-GRID_ALPHAS = [0.3, 0.5, 0.8, 1.0, 1.3, 1.5, 2.0]
+GRID_BEAM_WIDTHS = [50, 100, 200, 300]
+GRID_ALPHAS = [0.5, 0.7, 0.8, 0.9, 1.0, 1.3, 1.5]
 GRID_BETAS = [0.0, 0.5, 1.0, 1.5, 1.85, 2.0, 2.5]
 
 
@@ -20,8 +19,8 @@ def parse_args():
     p.add_argument("--split", default="test", choices=["train", "dev", "test"])
     p.add_argument("--method", choices=["greedy", "beam"], default="beam")
     p.add_argument("--beam-width", type=int, default=200)
-    p.add_argument("--alpha", type=float, default=0.80)
-    p.add_argument("--beta", type=float, default=1.85)
+    p.add_argument("--alpha", type=float, default=0.90)
+    p.add_argument("--beta", type=float, default=2.0)
     p.add_argument("--lm-path", default="/scratch/cr4206/sEMGencoderJEPA/data/lm.binary")
     p.add_argument("--unigrams-path", default="/scratch/cr4206/sEMGencoderJEPA/data/unigrams.txt")
     p.add_argument("--grid-search", action="store_true",
@@ -32,9 +31,6 @@ def parse_args():
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-
-    if not Path(args.unigrams_path).exists():
-        build_unigrams_from_cache(Path(args.cache_dir) / "train.pt", args.unigrams_path)
 
     eval_dataset = CachedRawEMGDataset(args.cache_dir, args.split)
     n_chars = len(eval_dataset.text_transform.chars)

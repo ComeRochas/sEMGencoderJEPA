@@ -89,7 +89,7 @@ slurm/evaluate.slurm            →  prints WER + CER (optionally grid-searches 
 `evaluate(model, dataset, device, method, ...)` in `ctc_utils.py`:
 - Internally splits into `compute_log_probs` (one batched GPU forward) + decode step
 - `method="greedy"`: GPU argmax + CTC collapse — fast (~2s on 200 samples)
-- `method="beam"`: pyctcdecode + KenLM (`data/lm.binary`) + unigrams (`data/unigrams.txt`, auto-built from train set if missing); decoded in parallel on CPU pool — ~25–90s on 200 samples
+- `method="beam"`: pyctcdecode + KenLM (`data/lm.binary`) + unigrams (`data/unigrams.txt`, auto-built from LibriSpeech vocab filtered through KenLM if missing — leakage-free generic English, see `semg_jepa/unigrams.py`); decoded in parallel on CPU pool — ~25–90s on 200 samples
 - `grid_search(...)`: one forward pass, then iterates over `(beam_width, alpha, beta)` combos reusing the cached log_probs. Used by `scripts/evaluate.py --grid-search` to tune on dev before reporting test
 - Returns `(wer, cer)` — both logged during training
 

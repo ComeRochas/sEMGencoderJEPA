@@ -24,8 +24,8 @@ from pyctcdecode import build_ctcdecoder
 if kenlm is not None and not hasattr(_pyctc_decoder, "kenlm"):
     _pyctc_decoder.kenlm = kenlm
 
-from semg_jepa.data_utils import TextTransform
 from semg_jepa.metrics import compute_cer, compute_wer
+from semg_jepa.unigrams import build_unigrams
 
 
 def load_unigrams(path):
@@ -33,35 +33,27 @@ def load_unigrams(path):
         return [line.strip() for line in f if line.strip()]
 
 
-def build_unigrams_from_cache(cache_path, out_path):
-    """Extract unique words from a precomputed split (.pt) into out_path."""
-    payload = torch.load(cache_path, map_location="cpu")
-    tt = TextTransform()
-    words: set[str] = set()
-    for sample in payload["samples"]:
-        words.update(tt.clean_text(sample["text"]).split())
-    Path(out_path).write_text("\n".join(sorted(words)) + "\n")
-    print(f"[ctc_utils] wrote {len(words)} unigrams to {out_path}", flush=True)
-
-
 _lm_available = None
 _cached_unigrams = {}
 
 
 def _check_lm_available(lm_path):
-    """Check if KenLM can be loaded (cached result)."""
+    """Check if KenLM can be loaded (cached result).
+
+    Probes via `kenlm.Model(...)` directly rather than building a dummy
+    pyctcdecode decoder — the latter emits spurious "no unigrams provided" /
+    "space token missing" warnings unrelated to the actual decode.
+    """
     global _lm_available
     if _lm_available is not None:
         return _lm_available
 
-    if not Path(lm_path).exists():
+    if kenlm is None or not Path(lm_path).exists():
         _lm_available = False
         return False
 
     try:
-        from pyctcdecode import build_ctcdecoder
-        labels = ["a", ""]  # dummy test
-        _ = build_ctcdecoder(labels, kenlm_model_path=lm_path)
+        kenlm.Model(str(lm_path))
         _lm_available = True
         print("[ctc_utils] KenLM loaded successfully", flush=True)
         return True
@@ -69,6 +61,22 @@ def _check_lm_available(lm_path):
         _lm_available = False
         print(f"[ctc_utils] KenLM unavailable ({type(e).__name__}: {e}); using beam search without LM", flush=True)
         return False
+
+
+def _ensure_unigrams(lm_path, unigrams_path):
+    """Return cached unigram list, building from LibriSpeech if the file is missing."""
+    if "unigrams" in _cached_unigrams:
+        return _cached_unigrams["unigrams"]
+
+    unigrams_path = Path(unigrams_path)
+    if not unigrams_path.exists():
+        if not Path(lm_path).exists():
+            return None
+        print(f"[ctc_utils] unigrams missing at {unigrams_path}; building from LibriSpeech vocab", flush=True)
+        build_unigrams(lm_path, unigrams_path)
+
+    _cached_unigrams["unigrams"] = load_unigrams(unigrams_path)
+    return _cached_unigrams["unigrams"]
 
 
 def build_decoder(chars, lm_path="data/lm.binary", unigrams_path="data/unigrams.txt",
@@ -81,11 +89,9 @@ def build_decoder(chars, lm_path="data/lm.binary", unigrams_path="data/unigrams.
         kwargs["alpha"] = alpha
         kwargs["beta"] = beta
 
-    if Path(unigrams_path).exists() and "unigrams" not in _cached_unigrams:
-        _cached_unigrams["unigrams"] = load_unigrams(unigrams_path)
-
-    if "unigrams" in _cached_unigrams:
-        kwargs["unigrams"] = _cached_unigrams["unigrams"]
+    unigrams = _ensure_unigrams(lm_path, unigrams_path)
+    if unigrams is not None:
+        kwargs["unigrams"] = unigrams
 
     return build_ctcdecoder(labels, **kwargs)
 
