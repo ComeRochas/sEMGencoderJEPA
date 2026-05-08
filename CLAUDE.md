@@ -2,12 +2,31 @@
 
 ## What this project is
 
-EMG-to-text silent speech framework. Three pipelines:
+EMG-to-text silent speech framework. Four pipelines:
 1. **Baseline CTC** — supervised, raw EMG → characters
-2. **JEPA pretraining** — self-supervised student/teacher encoder on raw EMG (BYOL-style)
-3. **JEPA fine-tuning** — CTC head on top of pretrained encoder
+2. **JEPA pretraining** — self-supervised student/teacher encoder on raw EMG (BYOL-style) — **on hold, see status below**
+3. **JEPA fine-tuning** — CTC head on top of pretrained encoder — on hold
+4. **UML training** — dual-branch CTC: EMG + LibriSpeech audio share a single Transformer
+   ("Better Together: Unpaired Modality Learning", Gosztolai et al. 2025, arXiv:2510.08492)
 
-Based on Gaddy & Klein's `silent_speech` codebase. Core hypothesis: JEPA pretraining learns better EMG representations, especially in low-label regimes.
+Based on Gaddy & Klein's `silent_speech` codebase. Original hypothesis: JEPA / UML
+auxiliary objectives learn better EMG representations, especially in low-label regimes.
+
+## Status (current direction)
+
+**UML is the active focus. JEPA is on hold.** Full-data results so far (test split, KenLM beam, no grid search):
+
+| Init / training | Test WER | Test CER | vs baseline |
+|---|---|---|---|
+| Supervised CTC baseline (random init, 200 ep) | 0.328 | 0.141 | reference |
+| JEPA pretrain → CTC finetune (200 ep) | ~0.33 (proj.) | ~0.14 | ≈ 0 (dev WER 0.403 vs baseline 0.396) |
+| UML EMG-branch (no finetune) | 0.291 | 0.133 | **−3.7 pp** |
+| UML separate-heads → finetune | **0.287** | **0.132** | **−4.0 pp** |
+| UML shared-head → finetune | 0.292 | 0.138 | −3.6 pp |
+
+Why JEPA gave no transfer at full labels: it pretrains on the same 16.9 h of EMG that supervised CTC already trains on, so there's no information advantage over the supervised baseline. UML wins because the shared transformer also sees ~100 h of LibriSpeech audio + a frozen `wav2vec2-base` prior, which is genuinely external information.
+
+Where JEPA could still earn its keep: low-label fractions (1-10%), where SSL benefit traditionally appears even without external data. The data-fraction sweep is the only honest test; until then, JEPA is parked. See [TODO.md](TODO.md) section C.
 
 ## Cluster & environment
 
@@ -67,6 +86,19 @@ CTC blank token = index 37. Vocab size = 38 total.
 
 `JEPAModel` (in `train_jepa.py`) = encoder + predictor MLP (student) + target_proj (teacher, EMA-updated)
 
+`UMLModel` (in `uml/model.py`) = dual-branch model:
+- EMG branch: `GaddyRawEMGEncoder` → `emg_ctc_head`
+- Audio branch: `AudioFrontend` (frozen `facebook/wav2vec2-base` + trainable
+  `nn.Linear(768, model_size)` projection) → SAME `transformer` instance →
+  `audio_ctc_head`
+- The Transformer is literally shared (`model.emg_encoder.transformer` is the
+  exact `nn.Module` evaluated on both paths).
+- `share_ctc_head` config flag (default `False`): if `True`, both branches use
+  one common CTC head; if `False`, each branch has its own readout.
+- AudioFrontend is always frozen on the wav2vec2 weights (only the
+  768→model_size linear projection trains).
+- Inference uses EMG branch only — `model(raw_emg)` delegates to `forward_emg`.
+
 ## Training pipeline
 
 All scripts read from `data/*.pt` via `CachedRawEMGDataset`. No live preprocessing.
@@ -83,6 +115,90 @@ slurm/evaluate.slurm            →  prints WER + CER (optionally grid-searches 
 `build_batches(dataset, max_len)` in `cached_dataset.py` builds size-aware batches (total raw_emg samples ≤ max_len). Called fresh each epoch for reshuffling.
 
 `combine_fixed_length(raw_emg_list, 1600)` reshapes variable-length list into `[B_chunks, 1600, 8]` before the encoder during training. NOT used during evaluation (model handles variable lengths natively).
+
+## UML pipeline specifics
+
+Implements ["Better Together: Unpaired Modality Learning"](https://arxiv.org/pdf/2510.08492)
+adapted to silent-speech CTC. The two modalities **share a single Transformer**;
+otherwise each has its own frontend + CTC head and is trained on its own
+(unpaired) labelled data.
+
+### Datasets & preprocessing
+
+- **EMG**: same `data/{train,dev,test}.pt` cache used by the baseline. Pipeline
+  matches Gaddy: notch + highpass + 689 Hz subsample + tanh normalize, fp16 on
+  disk. No special UML preprocessing.
+- **Audio**: LibriSpeech `train-clean-100` (28 539 utterances). Precomputed by
+  `scripts/precompute_audio.py` once on CPU:
+  1. FLAC → fp32 via `soundfile`
+  2. Resample to 16 kHz (no-op for LibriSpeech)
+  3. Per-sample zero-mean / unit-variance — matches
+     `Wav2Vec2FeatureExtractor` defaults
+  4. Cast to fp16
+  5. Encode transcript via the **shared** `TextTransform` (same 37-char vocab
+     as EMG: `[a-z0-9 ]`, blank @ 37). No separate audio vocab.
+- **Output**: `data/libri_cache/train-clean-100.pt` (~11 GB) — dict with
+  `audio: list[fp16 (T,)]`, `text_int: list[int64 (L,)]`, `version: 1`.
+
+### Architecture (`uml/model.py`)
+
+- `EMG → GaddyRawEMGEncoder → emg_ctc_head` (vanilla EMG path).
+- `audio → AudioFrontend → SHARED transformer → audio_ctc_head` where
+  `AudioFrontend` is `facebook/wav2vec2-base` (FROZEN, 95M params) followed by
+  a trainable `nn.Linear(768, model_size)` projection.
+- The Transformer is `model.emg_encoder.transformer` — the **exact same
+  `nn.Module`** used on both paths.
+- CTC heads: configurable. `share_ctc_head=False` (default) gives each branch
+  its own readout; `share_ctc_head=True` makes both branches use a single
+  shared `CTCHead`.
+- Audio frame rate: wav2vec2-base downsamples 16 kHz → ~50 Hz. Mask-aware
+  output lengths come from `_get_feat_extract_output_lengths`.
+
+### Training loop (`scripts/train_uml.py`)
+
+For each EMG batch in the EMG epoch:
+1. **EMG sub-step** — same as `train_baseline.py`: `combine_fixed_length(raw_emg, 1600)`
+   → encoder/transformer forward → `decollate_tensor` → per-sample CTC.
+   `loss_emg.backward()` (no scaling).
+2. **Audio sub-step** — pull next batch from an infinite-cycle audio loader
+   (LibriSpeech, `audio_batch_size=8` default, shuffled per epoch). Forward
+   through frozen wav2vec2 → projection → shared transformer → audio CTC head.
+   `(lambda_uml * loss_audio).backward()`.
+3. After both backwards: optional grad clip, `optim.step()`, `optim.zero_grad()`.
+
+So per optimizer step: one EMG batch + one audio batch, gradients accumulated.
+LR schedule = linear warmup (1000 steps) then `MultiStepLR([125,150,175], 0.5)`.
+
+### Data exposure
+
+- The EMG epoch (~8055 samples ÷ ~size-aware batches) defines an "epoch".
+- LibriSpeech is consumed via `_cycle(loader)`: it is reshuffled when the loop
+  restarts, so over the full run every audio sample is seen multiple times.
+- LibriSpeech (28k) >> EMG batches per epoch (~hundreds): the audio loader
+  doesn't finish a full pass within a single EMG epoch — but across many
+  epochs all audio data is seen.
+- All data is seen "equally" only in the long-run sense — per step, exactly
+  one EMG batch and one audio batch contribute (each weighted by its own
+  loss term).
+
+### Validation & checkpoints
+
+- Validation: EMG-only, on `dev`, via `ctc_utils.evaluate(eval_wrapper, ...)`.
+  `eval_wrapper` is a thin `nn.Module` calling `model.forward_emg(raw)`.
+- Saved per epoch:
+  - `runs/uml/last.pt` and `last_<ts>.pt` — full UMLModel state
+  - `runs/uml/last_emg_branch.pt` — encoder + EMG CTC head only, keys
+    remapped to `encoder.*` / `ctc_head.*` so it loads directly into
+    `BaselineCTCModel` (and `FinetuneCTCModel`)
+- Saved when `dev_wer` improves: `best.pt`, `best_<ts>.pt`, `best_emg_branch.pt`.
+- At end of run: `pretrained_encoder.pt` = `model.emg_encoder.state_dict()`,
+  drop-in for `--pretrained-encoder` in `finetune_from_jepa.py`.
+
+### Configuration
+
+`configs/train_uml.yaml`: knobs include `lambda_uml` (audio loss weight,
+default 1.0), `share_ctc_head` (default false), `audio_batch_size`,
+`max_batch_len` (EMG), `model_size`, `num_layers`, `dropout`, LR schedule.
 
 ## Evaluation
 
@@ -107,9 +223,11 @@ slurm/evaluate.slurm            →  prints WER + CER (optionally grid-searches 
 |--------------|-------------|---------|
 | `scripts/train_baseline.py` | `slurm/train_baseline.slurm` | Supervised CTC |
 | `scripts/train_jepa.py` | `slurm/train_jepa.slurm` | JEPA pretraining |
-| `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune |
+| `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune (works for UML encoder too) |
+| `scripts/train_uml.py` | `slurm/train_uml.slurm` | UML dual-branch CTC (EMG + LibriSpeech audio) |
 | `scripts/evaluate.py` | `slurm/evaluate.slurm` | WER+CER eval (greedy/beam, optional grid search) |
-| `scripts/precompute_raw_emg.py` | `slurm/precompute_raw_emg.slurm` | Cache builder |
+| `scripts/precompute_raw_emg.py` | `slurm/precompute_raw_emg.slurm` | EMG cache builder |
+| `scripts/precompute_audio.py` | `slurm/precompute_audio.slurm` | LibriSpeech cache builder (UML only) |
 
 ## Output directories (all under /scratch/cr4206/sEMGencoderJEPA/)
 
@@ -120,6 +238,8 @@ slurm/evaluate.slurm            →  prints WER + CER (optionally grid-searches 
 | `runs/baseline/` | Baseline CTC checkpoints |
 | `runs/jepa_pretrain/` | JEPA pretrain checkpoints + `pretrained_encoder.pt` |
 | `runs/jepa_finetune/` | JEPA finetune checkpoints |
+| `runs/uml/` | UML checkpoints + `pretrained_encoder.pt` (EMG-branch encoder) + `*_emg_branch.pt` (encoder + EMG CTC head) |
+| `data/libri_cache/` | LibriSpeech cache (UML only) — `<split>.pt`, ~11 GB for `train-clean-100` |
 
 ## How to run
 
@@ -134,6 +254,12 @@ sbatch slurm/train_baseline.slurm
 sbatch slurm/train_jepa.slurm
 # wait for pretrained_encoder.pt, then:
 sbatch slurm/finetune_from_jepa.slurm
+
+# UML training (one-shot LibriSpeech cache + dual-branch training)
+sbatch slurm/precompute_audio.slurm   # data/libri_cache/train-clean-100.pt (~11 GB)
+sbatch slurm/train_uml.slurm
+# Then optionally finetune from the UML EMG branch:
+PRETRAINED_ENCODER=runs/uml/pretrained_encoder.pt sbatch slurm/finetune_from_jepa.slurm
 
 # Evaluate (single checkpoint, defaults: split=test, method=beam, grid_search=on)
 sbatch slurm/evaluate.slurm
