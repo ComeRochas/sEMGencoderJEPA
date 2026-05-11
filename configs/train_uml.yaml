@@ -37,7 +37,7 @@ share_ctc_head: false
 #                        batch from both datasets is processed exactly once
 #                        per epoch. Audio dominates because it has more
 #                        batches; tune lambda_uml to rebalance.
-epoch_mode: both
+epoch_mode: alternate
 
 model_size: 768
 num_layers: 6

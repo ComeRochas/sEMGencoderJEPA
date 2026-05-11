@@ -45,7 +45,8 @@ def main(args):
         if args.grid_search:
             results = grid_search(model, dev_dataset, device,
                                   GRID_BEAM_WIDTHS, GRID_ALPHAS, GRID_BETAS,
-                                  lm_path=args.lm_path, unigrams_path=args.unigrams_path)
+                                  lm_path=args.lm_path, unigrams_path=args.unigrams_path, 
+                                  batch_size=1)
             print(f"  grid search on dev (top 10 of {len(results)}):")
             for bw, a, b, wer, cer in results[:10]:
                 print(f"    bw={bw:>3} alpha={a:.2f} beta={b:.2f}  WER={wer:.4f} CER={cer:.4f}")
@@ -57,7 +58,8 @@ def main(args):
         else:
             wer, cer = evaluate(model, eval_dataset, device, method=args.method,
                                 beam_width=args.beam_width, alpha=args.alpha, beta=args.beta,
-                                lm_path=args.lm_path, unigrams_path=args.unigrams_path)
+                                lm_path=args.lm_path, unigrams_path=args.unigrams_path, 
+                                batch_size=1)
         print(f"  WER ({args.split}): {wer:.4f}   CER ({args.split}): {cer:.4f}", flush=True)
 
 
