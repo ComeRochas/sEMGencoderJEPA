@@ -8,7 +8,7 @@ output_directory: /scratch/cr4206/sEMGencoderJEPA/runs/uml
 
 epochs: 200
 max_batch_len: 88000  # matches baseline: 128000 @ 1000 Hz == ~88000 @ 689 Hz
-fixed_raw_len: 1600
+fixed_raw_len: 1600   # matches proven-good baseline (3200 overfits at this dataset size)
 audio_batch_size: 8
 audio_num_workers: 2
 
@@ -18,7 +18,7 @@ l2: 0.0
 grad_accum_steps: 1
 lr_decay_milestones: [125, 150, 175]
 lr_decay_gamma: 0.5
-clip_grad_norm: 1.0
+clip_grad_norm: 1.0   # acts as gradient brake on noisier audio path; do not raise without rebalancing lambda_uml
 
 # Auxiliary audio CTC loss weight: total = loss_emg + lambda_uml * loss_audio
 lambda_uml: 1.0
@@ -26,7 +26,7 @@ lambda_uml: 1.0
 # If true, EMG and audio branches use the SAME CTCHead (one shared linear
 # readout). Default false: each branch has its own CTC head — matches the
 # reference implementation, lets each modality specialize its readout.
-share_ctc_head: true
+share_ctc_head: false
 
 # Epoch definition:
 #   alternate (default): each step does 1 EMG batch + 1 audio batch (paired

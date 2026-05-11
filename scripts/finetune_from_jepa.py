@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--lr-decay-gamma", type=float, default=0.5)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--freeze-encoder", action="store_true")
+    p.add_argument("--clip-grad-norm", type=float, default=0.0,
+                   help="Max grad norm before optim.step (0 disables).")
     p.add_argument("--model-size", type=int, default=768)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dropout", type=float, default=0.2)
@@ -116,6 +118,8 @@ def train(args):
 
             optim.zero_grad()
             loss.backward()
+            if args.clip_grad_norm and args.clip_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
             optim.step()
             losses.append(loss.item())
             global_step += 1

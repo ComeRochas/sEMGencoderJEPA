@@ -7,5 +7,7 @@ data/
 wandb/
 runs/
 gaddy_original/
+tbenst_silent_speech/
 slurm/precompute_gaddy_cache.slurm
 slurm/train_gaddy.slurm
+slurm/train_tbenst_baseline.slurm

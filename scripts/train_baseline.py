@@ -94,6 +94,8 @@ def train(args):
 
             t3 = time.perf_counter()
             if (global_step + 1) % args.grad_accum_steps == 0:
+                if args.clip_grad_norm and args.clip_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                 optim.step()
                 optim.zero_grad()
                 _sync(device)
@@ -149,6 +151,8 @@ def parse_args():
     p.add_argument("--learning-rate-warmup", type=int, default=1000)
     p.add_argument("--l2", type=float, default=0.0)
     p.add_argument("--grad-accum-steps", type=int, default=2)
+    p.add_argument("--clip-grad-norm", type=float, default=0.0,
+                   help="Max grad norm before optim.step (0 disables).")
     p.add_argument("--model-size", type=int, default=768)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dropout", type=float, default=0.2)
