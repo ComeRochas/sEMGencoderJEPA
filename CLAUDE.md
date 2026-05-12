@@ -6,8 +6,12 @@ EMG-to-text silent speech framework. Four pipelines:
 1. **Baseline CTC** — supervised, raw EMG → characters
 2. **JEPA pretraining** — self-supervised student/teacher encoder on raw EMG (BYOL-style) — **on hold, see status below**
 3. **JEPA fine-tuning** — CTC head on top of pretrained encoder — on hold
-4. **UML training** — dual-branch CTC: EMG + LibriSpeech audio share a single Transformer
-   ("Better Together: Unpaired Modality Learning", Gosztolai et al. 2025, arXiv:2510.08492)
+4. **UML training** — dual-branch CTC: EMG + audio share a single Transformer
+   ("Better Together: Unpaired Modality Learning", Gosztolai et al. 2025, arXiv:2510.08492).
+   Two audio sources supported and currently swept in parallel:
+   **LibriSpeech** (`train-clean-100`, ~100 h external) and **Gaddy-internal**
+   audio (the voiced recordings shipped with the EMG dataset, ~15 h — same
+   speakers and prompts as EMG, pairing not exploited).
 
 Based on Gaddy & Klein's `silent_speech` codebase. Original hypothesis: JEPA / UML
 auxiliary objectives learn better EMG representations, especially in low-label regimes.
@@ -128,17 +132,24 @@ otherwise each has its own frontend + CTC head and is trained on its own
 - **EMG**: same `data/{train,dev,test}.pt` cache used by the baseline. Pipeline
   matches Gaddy: notch + highpass + 689 Hz subsample + tanh normalize, fp16 on
   disk. No special UML preprocessing.
-- **Audio**: LibriSpeech `train-clean-100` (28 539 utterances). Precomputed by
-  `scripts/precompute_audio.py` once on CPU:
-  1. FLAC → fp32 via `soundfile`
-  2. Resample to 16 kHz (no-op for LibriSpeech)
-  3. Per-sample zero-mean / unit-variance — matches
-     `Wav2Vec2FeatureExtractor` defaults
-  4. Cast to fp16
-  5. Encode transcript via the **shared** `TextTransform` (same 37-char vocab
-     as EMG: `[a-z0-9 ]`, blank @ 37). No separate audio vocab.
-- **Output**: `data/libri_cache/train-clean-100.pt` (~11 GB) — dict with
-  `audio: list[fp16 (T,)]`, `text_int: list[int64 (L,)]`, `version: 1`.
+- **Audio (two interchangeable sources)** — both precomputed once on CPU into
+  the same payload schema (`audio: list[fp16 (T,)]`, `text_int: list[int64 (L,)]`,
+  `version: 1`). The cache is read by `uml/audio_dataset.py`, which is
+  format-agnostic.
+  - **LibriSpeech** (`scripts/precompute_audio.py` → `data/libri_cache/train-clean-100.pt`,
+    ~11 GB, 28 539 utterances, ~100 h, mean duration 6-12 s).
+  - **Gaddy-internal** (`scripts/precompute_audio_gaddy.py` →
+    `data/gaddy_audio_cache/gaddy_internal.pt`, ~1.7 GB, 7 052 utterances,
+    ~15 h, mean 7.5 s, **long-tail up to 54 s**). Walks
+    `voiced_parallel_data/` + `nonparallel_data/`, reads each
+    `{idx}_audio_clean.flac` paired with the transcript in `{idx}_info.json`.
+    Silent session dirs are skipped on purpose (their `audio_clean.flac` is a
+    re-recording of the same parallel sentences already in
+    `voiced_parallel_data/`).
+  - Per-sample pipeline (both): FLAC → fp32 → resample 16 kHz (no-op,
+    everything is already 16 kHz) → zero-mean/unit-variance (matches
+    `Wav2Vec2FeatureExtractor`) → fp16 → transcript encoded via the **shared**
+    `TextTransform` (same 37-char vocab as EMG, blank @ 37).
 
 ### Architecture (`uml/model.py`)
 
@@ -156,18 +167,37 @@ otherwise each has its own frontend + CTC head and is trained on its own
 
 ### Training loop (`scripts/train_uml.py`)
 
-For each EMG batch in the EMG epoch:
+Two scheduling modes via `--epoch-mode`:
+
+**`alternate` (default, recommended)** — per optimizer step, 1 EMG batch + 1
+audio batch (both backward, then `optim.step()`):
 1. **EMG sub-step** — same as `train_baseline.py`: `combine_fixed_length(raw_emg, 1600)`
    → encoder/transformer forward → `decollate_tensor` → per-sample CTC.
    `loss_emg.backward()` (no scaling).
-2. **Audio sub-step** — pull next batch from an infinite-cycle audio loader
-   (LibriSpeech, `audio_batch_size=8` default, shuffled per epoch). Forward
-   through frozen wav2vec2 → projection → shared transformer → audio CTC head.
+2. **Audio sub-step** — pull next batch from a cycling audio loader
+   (`audio_batch_size=8` default, reshuffled at each cycle). Forward through
+   frozen wav2vec2 → projection → shared transformer → audio CTC head.
    `(lambda_uml * loss_audio).backward()`.
 3. After both backwards: optional grad clip, `optim.step()`, `optim.zero_grad()`.
+   Per-step gradient is the sum of EMG and audio gradients on the shared
+   transformer.
 
-So per optimizer step: one EMG batch + one audio batch, gradients accumulated.
-LR schedule = linear warmup (1000 steps) then `MultiStepLR([125,150,175], 0.5)`.
+**`both`** — per step, 1 batch from a single modality, sampled uniformly from
+the union of all EMG and all audio batches (so every batch from both datasets
+is processed exactly once per epoch). With LibriSpeech audio dominates by
+~20× (n_audio_batches ≈ 3500 vs n_emg_batches ≈ 170); with Gaddy-internal it's
+~5×. Without rebalancing `lambda_uml`, the EMG path drifts (transformer aligns
+to audio statistics and the EMG CTC head can't recover during finetune —
+documented failure mode, job 8426709).
+
+LR schedule (both modes): linear warmup (1000 steps) then
+`MultiStepLR([125,150,175], 0.5)`. Optimizer = AdamW, lr=3e-4, weight_decay=0.
+
+**`clip_grad_norm`** — set to `0.0` (disabled) by default for new runs. The
+original 1.0 worked with LibriSpeech but causes CTC all-blank collapse on the
+EMG branch when paired with the noisier Gaddy-internal audio path (long-tail
+durations create occasional gradient spikes; clipping at 1.0 drowns the EMG
+signal under the audio direction). If you re-enable it, set ≥10.0.
 
 ### Data exposure
 
@@ -193,6 +223,20 @@ LR schedule = linear warmup (1000 steps) then `MultiStepLR([125,150,175], 0.5)`.
 - Saved when `dev_wer` improves: `best.pt`, `best_<ts>.pt`, `best_emg_branch.pt`.
 - At end of run: `pretrained_encoder.pt` = `model.emg_encoder.state_dict()`,
   drop-in for `--pretrained-encoder` in `finetune_from_jepa.py`.
+
+### Fine-tuning back to EMG-only (post-UML)
+
+Two paths, depending on whether the EMG CTC head should be warm-started:
+
+- **`scripts/finetune_from_uml.py`** (preferred for UML-init finetunes) — loads
+  encoder **and** EMG CTC head from `*_emg_branch.pt` (or extracts them from a
+  full UMLModel `last.pt` / `best.pt`). All optim hyperparameters mirror
+  `train_baseline` (lr=3e-4, warmup=1000, grad_accum=2, max_batch_len=88000,
+  eval_method=beam).
+- **`scripts/finetune_from_jepa.py`** — encoder-only init (head reset). Use
+  this when the upstream pretrain had no CTC head (JEPA) or you deliberately
+  want to throw the head away. The config now uses the same baseline-aligned
+  knobs (88000 / grad_accum=2 / beam eval).
 
 ### Configuration
 
@@ -223,11 +267,14 @@ default 1.0), `share_ctc_head` (default false), `audio_batch_size`,
 |--------------|-------------|---------|
 | `scripts/train_baseline.py` | `slurm/train_baseline.slurm` | Supervised CTC |
 | `scripts/train_jepa.py` | `slurm/train_jepa.slurm` | JEPA pretraining |
-| `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune (works for UML encoder too) |
-| `scripts/train_uml.py` | `slurm/train_uml.slurm` | UML dual-branch CTC (EMG + LibriSpeech audio) |
+| `scripts/finetune_from_jepa.py` | `slurm/finetune_from_jepa.slurm` | CTC finetune (encoder only; head reinitialized) |
+| `scripts/finetune_from_uml.py` | `slurm/finetune_from_uml.slurm` | CTC finetune (encoder + EMG CTC head loaded) |
+| `scripts/train_uml.py` | `slurm/train_uml.slurm` | UML dual-branch CTC with LibriSpeech audio |
+| `scripts/train_uml.py` | `slurm/train_uml_gaddy_audio.slurm` | Same script; reads `data/gaddy_audio_cache/gaddy_internal.pt` instead |
 | `scripts/evaluate.py` | `slurm/evaluate.slurm` | WER+CER eval (greedy/beam, optional grid search) |
 | `scripts/precompute_raw_emg.py` | `slurm/precompute_raw_emg.slurm` | EMG cache builder |
-| `scripts/precompute_audio.py` | `slurm/precompute_audio.slurm` | LibriSpeech cache builder (UML only) |
+| `scripts/precompute_audio.py` | `slurm/precompute_audio.slurm` | LibriSpeech cache builder (UML) |
+| `scripts/precompute_audio_gaddy.py` | `slurm/precompute_audio_gaddy.slurm` | Gaddy-internal audio cache builder (UML) |
 
 ## Output directories (all under /scratch/cr4206/sEMGencoderJEPA/)
 
@@ -239,7 +286,10 @@ default 1.0), `share_ctc_head` (default false), `audio_batch_size`,
 | `runs/jepa_pretrain/` | JEPA pretrain checkpoints + `pretrained_encoder.pt` |
 | `runs/jepa_finetune/` | JEPA finetune checkpoints |
 | `runs/uml/` | UML checkpoints + `pretrained_encoder.pt` (EMG-branch encoder) + `*_emg_branch.pt` (encoder + EMG CTC head) |
-| `data/libri_cache/` | LibriSpeech cache (UML only) — `<split>.pt`, ~11 GB for `train-clean-100` |
+| `runs/uml_gaddy_audio_lambda*/`, `runs/uml_libri_lambda*/` | Per-config UML output dirs for the audio-source × λ sweep |
+| `runs/finetune_uml_*/` | `finetune_from_uml.py` outputs (one per UML run) |
+| `data/libri_cache/` | LibriSpeech cache — `<split>.pt`, ~11 GB for `train-clean-100` |
+| `data/gaddy_audio_cache/` | Gaddy-internal audio cache — `gaddy_internal.pt`, ~1.7 GB |
 
 ## How to run
 
@@ -255,11 +305,16 @@ sbatch slurm/train_jepa.slurm
 # wait for pretrained_encoder.pt, then:
 sbatch slurm/finetune_from_jepa.slurm
 
-# UML training (one-shot LibriSpeech cache + dual-branch training)
-sbatch slurm/precompute_audio.slurm   # data/libri_cache/train-clean-100.pt (~11 GB)
+# UML training with LibriSpeech audio
+sbatch slurm/precompute_audio.slurm        # data/libri_cache/train-clean-100.pt (~11 GB)
 sbatch slurm/train_uml.slurm
-# Then optionally finetune from the UML EMG branch:
-PRETRAINED_ENCODER=runs/uml/pretrained_encoder.pt sbatch slurm/finetune_from_jepa.slurm
+
+# UML training with Gaddy-internal audio
+sbatch slurm/precompute_audio_gaddy.slurm  # data/gaddy_audio_cache/gaddy_internal.pt (~1.7 GB)
+sbatch slurm/train_uml_gaddy_audio.slurm
+
+# Finetune EMG-only from a UML EMG-branch checkpoint (loads encoder + head):
+EMG_BRANCH=runs/uml/best_emg_branch.pt sbatch slurm/finetune_from_uml.slurm
 
 # Evaluate (single checkpoint, defaults: split=test, method=beam, grid_search=on)
 sbatch slurm/evaluate.slurm

@@ -45,7 +45,7 @@ dropout: 0.2
 
 start_training_from: null
 
-eval_method: greedy   # greedy (fast, no LM) or beam (slow, LM if available)
+eval_method: beam   # greedy (fast, no LM) or beam (slow, LM if available)
 
 wandb: false
 wandb_entity: UMLforVideoLab

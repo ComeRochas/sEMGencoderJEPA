@@ -33,131 +33,116 @@ UML wins by ~4 pp WER at full labels. JEPA gives no transfer at full labels.
 
 ### Priority experiments (advisor-ordered)
 
-#### C.1 — UML `alternate` with **Gaddy-internal audio** as the audio modality
-Replace the LibriSpeech audio cache with the audio recordings already sitting next
-to every EMG file in Gaddy's dataset (`{idx}_audio_clean.flac` in
-`voiced_parallel_data/` and `nonparallel_data/`, and the parallel-voiced clip
-for `silent_parallel_data/`). Pairing with EMG is **not** exploited — the audio
-loader yields audio batches independently of the EMG batches, exactly as the
-LibriSpeech loader does. The hypothesis to test is that audio drawn from the
-*same latent distribution* as the EMG (same speakers, same prompts, same
-recording style) shapes the shared transformer more usefully than
-out-of-distribution LibriSpeech audio.
+#### C.a — Does `alternate` give a signal? Sweep audio-source × λ
+Six runs in flight (3 audio caches × 3 λ values), all with
+`epoch_mode: alternate`, `share_ctc_head: false`, `clip_grad_norm: 0.0`.
+Each followed by an EMG-only finetune (`finetune_from_uml.py`,
+`eval_method: greedy`) for a single comparable test number.
 
-Implementation plan:
-- New cache builder `scripts/precompute_audio_gaddy.py`: walk
-  `voiced_parallel_data/` + `nonparallel_data/`, for each `{idx}_info.json` load
-  `{idx}_audio_clean.flac`, resample to 16 kHz, zero-mean/unit-var, fp16. For
-  `silent_parallel_data/`, look up the parallel voiced clip via
-  `voiced_data_locations` (same logic Gaddy uses for silent→voiced alignment).
-  Encode the transcript via the same shared `TextTransform`. Write to
-  `data/gaddy_audio_cache/train.pt`.
-- Add `--audio-cache` flag to `scripts/train_uml.py` so we can swap caches
-  without code changes.
-- Train UML `alternate`, `separate_heads`, 200 epochs, same lr schedule as
-  current best (`runs/uml/best.pt`).
-- Evaluate UML EMG-branch directly + after EMG-only finetune.
+| Audio | λ_uml | UML jobid | Finetune jobid | UML output | Finetune output |
+|---|---|---|---|---|---|
+| Gaddy-internal | 1.0 | 8508274 (RUN) | 8522327 | `runs/uml_gaddy_audio_lambda1.0/` | `runs/finetune_uml_gaddy_lambda1.0/` |
+| Gaddy-internal | 0.5 | 8508275 (RUN) | 8522328 | `runs/uml_gaddy_audio_lambda0.5/` | `runs/finetune_uml_gaddy_lambda0.5/` |
+| Gaddy-internal | 0.3 | 8508276 (PEND QOS) | 8522329 | `runs/uml_gaddy_audio_lambda0.3/` | `runs/finetune_uml_gaddy_lambda0.3/` |
+| LibriSpeech    | 1.0 | 8522323 (PEND, h200) | 8522330 | `runs/uml_libri_lambda1.0/` | `runs/finetune_uml_libri_lambda1.0/` |
+| LibriSpeech    | 0.5 | 8522324 (PEND, h200) | 8522331 | `runs/uml_libri_lambda0.5/` | `runs/finetune_uml_libri_lambda0.5/` |
+| LibriSpeech    | 0.3 | 8522325 (PEND, h200) | 8522332 | `runs/uml_libri_lambda0.3/` | `runs/finetune_uml_libri_lambda0.3/` |
 
-Expected reading: if WER ≤ 0.287, in-distribution audio helps and the
-LibriSpeech run was suboptimal; if WER significantly worse, then *external
-linguistic breadth* (LibriSpeech) matters more than *acoustic-distribution
-match*. Either result is a clean scientific signal.
+Hypotheses being tested simultaneously:
+1. **Audio-source effect**: does in-distribution Gaddy audio shape the shared
+   transformer better than out-of-distribution LibriSpeech? (3 vs 3 paired
+   comparison at matched λ).
+2. **λ effect**: does down-weighting the audio loss (0.3, 0.5 vs 1.0) help or
+   hurt the EMG path? Looking for a non-flat curve.
+3. **UML beats baseline**: does any of the 6 finetunes get below baseline
+   (test WER 0.328)?
 
-A real risk to plan around: Gaddy's audio is ~17 h (≈ EMG duration), vs
-LibriSpeech's 100 h. With far fewer audio batches per cycle in `alternate`, the
-audio branch may overfit. Mitigation: lower audio batch size and/or stronger
-audio dropout; keep `lambda_uml=1.0` to start, then sweep.
+Decisions to make once results land:
+- Pick the best (audio-source, λ) combination for downstream sweeps.
+- If Gaddy-internal ≈ LibriSpeech at full labels, the gain comes from
+  "any external audio + wav2vec2 prior" rather than from in-distribution
+  match. If Gaddy clearly wins, the speaker/prompt-match story holds.
 
-#### C.2 — UML in the **unsupervised setting of the Better Together paper**
+Lessons already baked in (do not repeat):
+- `clip_grad_norm: 1.0` is incompatible with the noisier Gaddy audio path —
+  it pinned the EMG branch in the CTC all-blank attractor (run 8450813,
+  cancelled). Disabled for all 6 runs.
+- `share_ctc_head: true` underperforms (0.292 vs 0.287 at full labels).
+  Kept off.
+
+#### C.b — Make `both` work: rebalance audio, document the failure mode
+Current state: `epoch_mode=both` UML run + EMG-only finetune produced flat
+loss for 200 epochs (job 8426709). Confirmed mechanism: with LibriSpeech +
+`audio_batch_size=8`, audio batches outnumber EMG batches by ~20× per
+epoch (3500 vs 170), so the shared transformer drifts to a ~50 Hz wav2vec2
+regime and the EMG branch can't recover during finetune (lr already at lr/8
+by the time it would catch up).
+
+Tasks, in order:
+- [ ] **Raise `audio_batch_size` to rebalance step counts.** With `bs=64`,
+      `n_audio_batches ≈ 446`, ratio drops from ~20× to ~2.6×. With `bs=128`,
+      ratio ~1.3×. Cleanest single-knob fix (no math on losses, just batch
+      sizing). Try `bs=64` first.
+- [ ] **In parallel, sweep `lambda_uml ∈ {0.05, 0.1, 0.3}` in `both`** to
+      compensate for the residual step-count imbalance with default
+      `audio_batch_size=8`. The two knobs reach similar balance from
+      different sides — keep whichever gives best finetune WER.
+- [ ] **If neither single fix recovers**, try the two-phase schedule:
+      phase 1 = `both` (transformer learns linguistic structure from audio
+      breadth), phase 2 = `alternate` with `lambda_uml=1.0` (co-train +
+      rebalance), phase 3 = EMG-only finetune.
+- [ ] **Document the failure mode and the fix** in `RESULTS.md` either way.
+
+Open question: does `both` with proper rebalancing actually beat `alternate`,
+or does it just match it? The advisor's stated goal is "exploit more audio
+without killing EMG". `alternate` already does that (each audio batch sees
+the EMG path's gradient at the same step); `both` only helps if seeing
+*more distinct* audio batches per epoch lets the transformer converge to a
+better linguistic representation. If C.a shows that audio-source effect is
+strong (Gaddy wins) but step count is weak (`λ=1.0`, `λ=0.3` similar),
+then `both` is unlikely to add anything in expectation.
+
+#### C.c — UML in the **unsupervised setting** of the Better Together paper
 Replace the dual-CTC objective with paired SSL objectives on both modalities,
 sharing the same transformer. wav2vec2 stays frozen (the audio-side SSL is
-upstream of our wav2vec2 features — we only need an SSL task *on top of* them).
-EMG-side encoder + transformer is the part we pretrain.
+upstream of our wav2vec2 features). The EMG-side encoder + transformer is the
+part we pretrain.
 
 Design sketch (to be refined):
-- **Common SSL objective family**: masked-latent prediction with an EMA
-  teacher, BYOL/data2vec style. For each modality, mask spans of the
-  transformer input, predict the EMA-teacher representation of the masked
-  positions. Same loss formula on both branches; only the input pipeline
-  differs.
+- **Common SSL objective**: masked-latent prediction with an EMA teacher,
+  data2vec/BYOL style. For each modality, mask spans of the transformer
+  input, predict the EMA-teacher representation of the masked positions.
 - Audio branch: `wav2vec2(audio) → proj → mask → shared_transformer →
   predictor → loss against EMA(shared_transformer(unmasked))`.
-- EMG branch: `conv_blocks(raw_emg) → mask → shared_transformer → predictor →
-  loss against EMA(shared_transformer(unmasked))`.
-- Single optimizer step = EMG SSL grad + audio SSL grad (i.e., `alternate`
-  scheduling adapted to SSL).
-- After SSL convergence, throw away the predictor and audio branch; finetune
-  the EMG encoder + transformer with CTC on labeled EMG.
+- EMG branch: `conv_blocks(raw_emg) → mask → shared_transformer →
+  predictor → loss against EMA(shared_transformer(unmasked))`.
+- Single optimizer step = EMG SSL grad + audio SSL grad (`alternate` adapted
+  to SSL).
+- After SSL convergence, finetune the EMG encoder + transformer with CTC on
+  labeled EMG (reuse `finetune_from_uml.py` once we restore an EMG head, or
+  `finetune_from_jepa.py`).
 
 Open design questions before coding:
-- Use the **same predictor** for both modalities (forces shared structure
-  end-to-end) or **separate predictors** (probably easier to converge — same
-  argument as `separate_heads` winning in C).
-- Mask ratio and span length per modality: EMG at 86 Hz vs audio post-wav2vec2
-  at 50 Hz are not the same time granularity; pick mask spans by *seconds*
-  not by frames.
-- EMA teacher: one teacher transformer (shared) or two? Sharing keeps the
-  unified-representation premise; two teachers (one per modality) is more
-  flexible but blurs the point.
+- One predictor or two (same argument as `separate_heads` winning in C.a).
+- Mask spans by *seconds*, not by frames (EMG 86 Hz vs audio post-wav2vec2
+  50 Hz are not the same granularity).
+- One EMA teacher transformer (shared) or two (one per modality)? Shared
+  keeps the unified-representation premise; separate is easier to converge
+  but blurs the point.
 
-Compare against: the standalone JEPA pretrain (which gave ~0 transfer at full
-data) **and** the CTC-UML (C.1 result). The expected gain of SSL-UML over
-JEPA-only is the same mechanism as why CTC-UML beats baseline: the shared
-transformer gets information from outside the EMG pool. Whether SSL gives more
-or less than CTC-supervised audio is the empirical question.
+Compare against: the standalone JEPA pretrain (~0 transfer at full data) and
+the CTC-UML winner from C.a. SSL-UML wins iff the shared transformer gets
+*more* information from the audio pool than the CTC-UML audio supervision
+already extracts — uncertain a priori.
 
-#### C.3 — UML `both`: diagnose finetune failure and rebalance
-Current state: `epoch_mode=both` UML run + EMG-only finetune (job 8426709)
-produced no learning after 200 epochs of finetune. Need to:
-
-1. **Diagnose.** Likely causes, in order of probability:
-   - **Transformer drift toward audio.** With `both`, audio steps outnumber
-     EMG steps by ~20× per epoch (n_audio_batches / n_emg_batches ≈ 3500/170).
-     The shared transformer ends UML training tuned to ~50 Hz wav2vec2-feature
-     statistics, not to EMG features. The EMG path's projection
-     (`w_raw_in`) and the CTC head also saw ~20× fewer gradients than the
-     audio side, so they're under-fit.
-   - **LR schedule already collapsed.** Finetune uses
-     `MultiStepLR([125,150,175], 0.5)` — by the time the encoder catches up
-     (probably needs many epochs to recover from audio drift), the lr is
-     already at lr/8. Plot `dev_wer` vs epoch from job 8426709 to confirm.
-   - **`best_emg_branch.pt` checkpoint pathology.** If during UML-both
-     training the EMG dev WER never improved past initialization, then
-     `best.pt == init` or close to it. Inspect the saved logs.
-   - **BN running stats**: should be EMG-only (BN sits in `conv_blocks`,
-     which only runs on EMG path), so this is unlikely — but verify in the
-     state_dict to be sure.
-
-2. **Mitigations to try** (cheapest first):
-   - **Rebalance batches in `both`**: per epoch, subsample audio to roughly
-     `n_emg_batches` batches (random pick + reshuffle next epoch). Result is
-     an `alternate`-like balance but with the "all batches seen exactly
-     once" guarantee deliberately broken. Cleanest single-knob fix.
-   - **Lower `lambda_uml`** in `both` (e.g., 0.1 or 0.05) so each audio step
-     contributes proportionally less gradient. Compensates for the audio
-     step *count* without touching the schedule.
-   - **Two-phase schedule**: phase 1 `both` (transformer learns linguistic
-     structure from audio breadth), phase 2 `alternate` with `lambda_uml=1.0`
-     (rebalance + co-train), phase 3 EMG-only finetune.
-   - **Boost finetune lr / re-warm-up**: longer warmup, higher peak lr in
-     finetune, no MultiStepLR decay until epoch 50+. Lets the EMG path
-     recover from audio drift.
-   - **Drop `both` if none of the above recovers it.** The advisor goal is
-     "use lots of audio without killing EMG"; `alternate` with longer
-     training + `train-clean-360` already achieves that, and is the natural
-     fallback.
-
-3. **Write up the failure mode** in `RESULTS.md` either way — a documented
-   negative result on `both` is useful evidence about the mechanism by which
-   UML helps EMG.
-
-### Other UML follow-ups (lower priority, do after C.1–C.3)
+### Other UML follow-ups (lower priority, after C.a–C.c)
 - [x] LibriSpeech `train-clean-100` cache built (~11 GB, 28539 utterances)
-- [x] UML separate-heads training (200 epochs) → test WER 0.287 / CER 0.132 after finetune
-- [x] UML shared-head training (200 epochs) → test WER 0.292 / CER 0.138 after finetune
+- [x] Gaddy-internal audio cache built (~1.7 GB, 7052 utterances, ~15 h)
+- [x] UML separate-heads training (200 epochs) → test WER 0.287 / CER 0.132 after finetune (LibriSpeech, λ=1.0, May 7)
+- [x] UML shared-head training (200 epochs) → test WER 0.292 / CER 0.138 after finetune (LibriSpeech, May 7)
 - [x] Direct evaluation of UML EMG-branch without finetune — test WER 0.291 / CER 0.133
-- [ ] **Data-fraction sweep on UML-finetune.** Train at label fractions {50%, 25%, 10%, 5%, 1%} starting from `runs/uml/pretrained_encoder.pt`. Compare to baseline at the same fractions to characterize how UML's WER advantage scales with label scarcity. *(Requires `--data-fraction` flag — `CachedRawEMGDataset.subset()` already exists.)*
-- [ ] **Push UML further at full data.** Possible levers: longer training (300 ep), higher `lambda_uml`, larger LibriSpeech split (`train-clean-360` or `train-other-500`), unfreeze last 1-2 wav2vec2 layers near end of training.
+- [ ] **Data-fraction sweep on UML-finetune.** Train at label fractions {50%, 25%, 10%, 5%, 1%} starting from the best `runs/uml*/pretrained_encoder.pt` from C.a. Compare to baseline at the same fractions to characterize how UML's WER advantage scales with label scarcity. *(Requires `--data-fraction` flag — `CachedRawEMGDataset.subset()` already exists.)*
+- [ ] **Push UML further at full data.** Possible levers: longer training (300 ep), larger LibriSpeech split (`train-clean-360` or `train-other-500`), unfreeze last 1-2 wav2vec2 layers near end of training.
 - [ ] Robustness: evaluate UML EMG-branch under one/two dropped channels, additive noise, time masking. Compare to baseline robustness.
 - [ ] Cross-session generalization: hold out one session, train UML on the rest, evaluate on held-out. Compare to baseline.
 

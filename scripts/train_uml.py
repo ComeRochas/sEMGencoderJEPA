@@ -205,7 +205,8 @@ def train(args):
         )
         return loader_local, len(batches_local)
 
-    def _emg_step(example) -> float:
+    def _emg_step(example, t):
+        t1 = time.perf_counter()
         raw = combine_fixed_length(example["raw_emg"], args.fixed_raw_len).to(device)
         emg_logits = model.forward_emg(raw)                              # (n_blocks, T_block, V+1)
         emg_logp = F.log_softmax(emg_logits.float(), dim=-1)
@@ -217,10 +218,17 @@ def train(args):
             emg_logp, targets, example["lengths"], example["text_int_lengths"],
             blank=n_chars, zero_infinity=True,
         )
+        _sync(device)
+        t["fwd_emg"] += time.perf_counter() - t1
+
+        t2 = time.perf_counter()
         loss_emg.backward()
+        _sync(device)
+        t["bwd_emg"] += time.perf_counter() - t2
         return loss_emg.item()
 
-    def _audio_step(audio_batch) -> float:
+    def _audio_step(audio_batch, t):
+        t1 = time.perf_counter()
         wav = audio_batch["audio_features"].to(device)
         audio_lengths = audio_batch["audio_lengths"].to(device)
         a_targets = audio_batch["text_int"].to(device)
@@ -231,7 +239,13 @@ def train(args):
             audio_logits, a_targets, audio_input_lengths, a_target_lengths,
             blank=model.blank_id,
         )
+        _sync(device)
+        t["fwd_audio"] += time.perf_counter() - t1
+
+        t2 = time.perf_counter()
         (args.lambda_uml * loss_audio).backward()
+        _sync(device)
+        t["bwd_audio"] += time.perf_counter() - t2
         return loss_audio.item()
 
     for epoch in range(args.epochs):
@@ -243,45 +257,71 @@ def train(args):
         audio_iter = iter(audio_loader)
 
         emg_losses, audio_losses = [], []
+        t = {"data_emg": 0.0, "data_audio": 0.0,
+             "fwd_emg": 0.0, "bwd_emg": 0.0,
+             "fwd_audio": 0.0, "bwd_audio": 0.0,
+             "opt": 0.0}
         epoch_start = time.perf_counter()
         n_steps = 0
 
         if args.epoch_mode == "alternate":
             # 1 EMG + 1 audio per step, paired backward, single optim.step.
+            t0 = time.perf_counter()
             for _ in range(n_emg_batches):
                 schedule_lr(global_step)
-                emg_losses.append(_emg_step(next(emg_iter)))
+
+                emg_batch = next(emg_iter)
+                t["data_emg"] += time.perf_counter() - t0
+                emg_losses.append(_emg_step(emg_batch, t))
+
+                t_audio_data0 = time.perf_counter()
                 try:
                     audio_batch = next(audio_iter)
                 except StopIteration:
                     audio_iter = iter(audio_loader)  # reshuffles
                     audio_batch = next(audio_iter)
-                audio_losses.append(_audio_step(audio_batch))
+                t["data_audio"] += time.perf_counter() - t_audio_data0
+                audio_losses.append(_audio_step(audio_batch, t))
 
+                t_opt0 = time.perf_counter()
                 if (global_step + 1) % args.grad_accum_steps == 0:
                     if args.clip_grad_norm and args.clip_grad_norm > 0:
                         nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                     optim.step()
                     optim.zero_grad()
+                    _sync(device)
+                t["opt"] += time.perf_counter() - t_opt0
+
                 global_step += 1
                 n_steps += 1
+                t0 = time.perf_counter()
         else:  # "both": each step is one modality, all batches seen exactly once.
             sched = ["emg"] * n_emg_batches + ["audio"] * n_audio_batches
             random.shuffle(sched)
+            t0 = time.perf_counter()
             for modality in sched:
                 schedule_lr(global_step)
                 if modality == "emg":
-                    emg_losses.append(_emg_step(next(emg_iter)))
+                    emg_batch = next(emg_iter)
+                    t["data_emg"] += time.perf_counter() - t0
+                    emg_losses.append(_emg_step(emg_batch, t))
                 else:
-                    audio_losses.append(_audio_step(next(audio_iter)))
+                    audio_batch = next(audio_iter)
+                    t["data_audio"] += time.perf_counter() - t0
+                    audio_losses.append(_audio_step(audio_batch, t))
 
+                t_opt0 = time.perf_counter()
                 if (global_step + 1) % args.grad_accum_steps == 0:
                     if args.clip_grad_norm and args.clip_grad_norm > 0:
                         nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                     optim.step()
                     optim.zero_grad()
+                    _sync(device)
+                t["opt"] += time.perf_counter() - t_opt0
+
                 global_step += 1
                 n_steps += 1
+                t0 = time.perf_counter()
 
         train_emg = float(np.mean(emg_losses)) if emg_losses else 0.0
         train_audio = float(np.mean(audio_losses)) if audio_losses else 0.0
@@ -295,10 +335,15 @@ def train(args):
         cur_lr = optim.param_groups[0]["lr"]
 
         logging.info(
-            "epoch=%d/%d steps=%d lr=%.2e emg_loss=%.4f audio_loss=%.4f "
-            "lambda=%.3f dev_wer=%.3f dev_cer=%.3f t_eval=%.1fs t_epoch=%.1fs",
+            "epoch=%d/%d steps=%d lr=%.2e emg_loss=%.4f audio_loss=%.4f lambda=%.3f "
+            "dev_wer=%.3f dev_cer=%.3f t_data_emg=%.1fs t_data_audio=%.1fs "
+            "t_fwd_emg=%.1fs t_bwd_emg=%.1fs t_fwd_audio=%.1fs t_bwd_audio=%.1fs "
+            "t_opt=%.1fs t_eval=%.1fs t_epoch=%.1fs",
             epoch + 1, args.epochs, n_steps, cur_lr,
-            train_emg, train_audio, args.lambda_uml, wer, cer, t_eval, t_epoch,
+            train_emg, train_audio, args.lambda_uml, wer, cer,
+            t["data_emg"], t["data_audio"],
+            t["fwd_emg"], t["bwd_emg"], t["fwd_audio"], t["bwd_audio"],
+            t["opt"], t_eval, t_epoch,
         )
         wandb_log(run, {
             "eval/wer": wer, "eval/cer": cer,
@@ -307,6 +352,10 @@ def train(args):
             "train/total_loss": train_emg + args.lambda_uml * train_audio,
             "train/lr": cur_lr,
             "uml/lambda": args.lambda_uml,
+            "time/data_emg": t["data_emg"], "time/data_audio": t["data_audio"],
+            "time/fwd_emg": t["fwd_emg"], "time/bwd_emg": t["bwd_emg"],
+            "time/fwd_audio": t["fwd_audio"], "time/bwd_audio": t["bwd_audio"],
+            "time/opt": t["opt"],
             "time/eval": t_eval, "time/epoch": t_epoch,
             "epoch": epoch + 1,
         })
